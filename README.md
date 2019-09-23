@@ -44,18 +44,18 @@ We started by cutting and pasting the parts of libimxvpuapi responsible for h264
 6) Finally, this is still in the early stage of the development, and we cannot provide any support. Please consider yourself warned.
 
 ## How to build and test
-`scripts/build.sh` should build the library and `vpu_playback` tool
-One can use `vpu_playback` to play back raw "Annex B" h264 and IVF-wrapped VP8 streams, like that:
-`vpu_playback framebuffer stream0[@offset0] [stream1[@offset1]]...`
-So for example:
-`vpu_playback /dev/fb0 annex_b.h264` will play back `annex_b.h264` on `/dev/fb0`
-`vpu_playback /dev/fb0 annex_b.h264@400000` will do the same, but starting from offset `400000`
-`vpu_playback /dev/fb0 annex_b.h264 vp8.ivf` will try to play back two streams at once
+`scripts/build.sh` should build the library and `vpu_playback` tool  
+One can use `vpu_playback` to play back raw "Annex B" h264 and IVF-wrapped VP8 streams, like that:  
+`vpu_playback framebuffer stream0[@offset0] [stream1[@offset1]]...`  
+So for example:  
+`vpu_playback /dev/fb0 annex_b.h264` will play back `annex_b.h264` on `/dev/fb0`  
+`vpu_playback /dev/fb0 annex_b.h264@400000` will do the same, but starting from offset `400000`  
+`vpu_playback /dev/fb0 annex_b.h264 vp8.ivf` will try to play back two streams at once  
 and so on.
 
 ## Authors
 
-Michal Adamczak (michal@airtame.com) - programming, testing, bugfixes
-Pierre Fourgeaud (https://github.com/pierrefourgeaud) - code reviews, testing, bugfixes
-Razvan Lar - code reviews, code structure suggestions, testing, bugfixes
-Vasile Popescu - h264 bitstream and SPS parsing code
+Michal Adamczak (michal@airtame.com) - programming, testing, bugfixes  
+Pierre Fourgeaud (https://github.com/pierrefourgeaud) - code reviews, testing, bugfixes  
+Razvan Lar - code reviews, code structure suggestions, testing, bugfixes  
+Vasile Popescu - h264 bitstream and SPS parsing code  
