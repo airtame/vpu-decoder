@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019  AIRTAME ApS
+ * Copyright (c) 2019-2020  AIRTAME ApS
  * All Rights Reserved.
  *
  * See LICENSE.txt for further information.
@@ -7,25 +7,27 @@
 
 #pragma once
 
+#include "pack_queue.hpp"
 #include "simple_logger.hpp"
 #include "stream_handler.hpp"
+#include "vp8_stream_parser.hpp"
 #include "vpu_decoder.hpp"
 
 namespace airtame {
 class VP8StreamHandler : public StreamHandler {
 private:
     SimpleLogger m_logger;
-    IVPUDecoder *m_decoder = nullptr;
     size_t m_number_of_display_frames;
-    bool m_wait_for_frames;
+    PackQueue m_packs;
+    VP8StreamParser m_parser;
+    VPUDecoder m_decoder;
+    VPUOutputFrame m_decoded_frame;
+    size_t m_fake_timestamp = 0;
 
 public:
-    VP8StreamHandler(Stream &stream, bool wait_for_frames);
+    VP8StreamHandler(Stream &stream);
     virtual ~VP8StreamHandler()
     {
-        if (m_decoder) {
-            delete m_decoder;
-        }
     }
 
     void offset(size_t off);
@@ -33,5 +35,8 @@ public:
     bool step();
     void swap();
     bool is_interleaved();
+
+private:
+    bool load_frame();
 };
 }

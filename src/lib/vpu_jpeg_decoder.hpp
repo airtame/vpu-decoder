@@ -10,10 +10,11 @@
 #include <stddef.h>
 
 #include "codec_common.hpp"
+#include "codec_logger.hpp"
 #include "vpu_dma_pointer.hpp"
 
 namespace airtame {
-/* Unlike H264 and VP8 decoder this is extremely simple, and doesn't contain
+/* Unlike H264 and VP8 decoder this is extremely simple, and doesn't carry
  decoder/session internally. This is because 1) there is no such thing as
  JPEG decoding state, even for MJPEG we should be able to "one shot decode"
  frames, and that won't need any previous information and won't carry information
@@ -34,10 +35,8 @@ public:
     static VPUDMAPointer produce_jpeg_frame(const FrameGeometry &geometry);
     /* Bitstream should contain all jpeg data, output should be frame created
      by routine above */
-    static bool decode(const FrameGeometry &geometry, VPUDMAPointer bitstream,
-                       VPUDMAPointer output, bool interleaved = true);
-
-private:
-    static void vpu_error_function(const char *msg, void *user_data);
+    static bool decode(CodecLogger &logger, const FrameGeometry &geometry,
+                       VPUDMAPointer bitstream, VPUDMAPointer output,
+                       bool interleaved = true);
 };
 }

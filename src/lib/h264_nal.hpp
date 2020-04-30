@@ -45,6 +45,8 @@ enum class H264Profile {
     MAIN = 77,
     EXTENDED = 88,
     // Fidelity Range Extensions profiles
+    FRE_SCALABLE_BASELINE = 83,
+    FRE_SCALABLE_HIGH = 86,
     FRE_HIGH_PROFILE = 100, // YUV 4:2:0/8 "High".
     FRE_HIGH_PROFILE_10 = 110, // YUV 4:2:0/10 "High 10"
     FRE_HIGH_PROFILE_422 = 122, // YUV 4:2:2/10 "High 4:2:2"
@@ -82,6 +84,7 @@ struct SpsNalInfo {
     H264Profile profile_idc;
     uint32_t level_idc;
     uint32_t seq_parameter_set_id;
+    bool separate_colour_plane_flag;
 
     /* Type of picture order count encoding (0, 1 or 2) */
     uint32_t pic_order_cnt_type;
@@ -147,7 +150,7 @@ struct SpsNalInfo {
      dimensions when displaying, however all four are computed because different display engines
      may use different coordinate systems */
     size_t true_crop_offset_left, true_crop_offset_right,
-        true_crop_offset_bottom, true_crop_offset_top;
+    true_crop_offset_bottom, true_crop_offset_top;
 };
 
 struct PpsNalInfo {
@@ -166,41 +169,42 @@ struct PpsNalInfo {
 };
 
 struct SliceHeaderInfo {
-    /* Original values */
-    uint32_t ref_nal_idc;
+    /* Original values. Note that we use these for various purposes, but
+     these needed to tell frames apart according to standard are additionally
+     marked */
+    uint32_t ref_nal_idc; /* NEEDED to tell frames apart */
     NalType nal_unit_type;
     uint32_t slice_type;
-    uint32_t pic_parameter_set_id;
-    uint32_t frame_num;
-    uint32_t idr_pic_id;
+    int pic_parameter_set_id; /* Also NEEDED to tell frames apart */
+    uint32_t frame_num; /* NEEDED to tell frames apart */
+    uint32_t idr_pic_id; /* NEEDED to tell frames apart */
 
-    uint32_t pic_order_cnt_lsb;
-    uint32_t delta_pic_order_cnt_bottom;
-    uint32_t delta_pic_order_cnt[2];
-    uint32_t redundant_pic_cnt;
+    uint32_t pic_order_cnt_lsb; /* NEEDED to tell frames apart */
+    uint32_t delta_pic_order_cnt_bottom; /* NEEDED to tell frames apart */
+    uint32_t delta_pic_order_cnt[2]; /* NEEDED to tell frames apart */
+    /* If zero, then primary, if nonzero then redundant and all have same ids */
+    uint32_t redundant_pic_cnt; /* NEEDDED to tell frames apart */
 
-    // TODO: these stem from PPS and are optionally overridden in SliceHeader?
-    uint32_t num_ref_idx_l0_active_minus1;
-    uint32_t num_ref_idx_l1_active_minus1;
+    bool field_pic_flag; /* NEEDED to tell frames apart */
+    bool bottom_field_flag; /* NEEDED to tell frames apart */
 
-    bool field_pic_flag;
-    bool bottom_field_flag;
-
-    /* Generated values */
+    /* Generated values - custom for this code */
     H264SliceType h264_slice_type;
-    bool had_memory_management_control_operation_equal_to_5;
+    bool first_slice_of_idr_picture;
+
+    /* Generated values - as specified by standard, and following naming style
+     established there for generated values */
+    bool IdrPicFlag; /* NEEDED to tell frames apart */
 };
 
 bool at_h264_get_nal_type(const unsigned char *data, size_t size, NalType &out_nal_type);
 bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &out_sps_info);
 bool at_h264_get_pps_info(const unsigned char *data, size_t size, PpsNalInfo &out_pps_info);
-/* This function reads just enough of slice header to fill in
- pic_parameter_set_id field. Caller needs this field to find proper SPS/PPS and
- call "full" version of function then (below) */
 bool at_h264_get_initial_slice_header_info(const unsigned char *data, size_t size,
                                            SliceHeaderInfo &slice_header_info);
 bool at_h264_get_full_slice_header_info(const unsigned char *data, size_t size,
                                         const SpsNalInfo &sps, const PpsNalInfo &pps,
                                         SliceHeaderInfo &slice_header_info);
+bool at_h264_are_different_pictures(const SliceHeaderInfo &current, const SliceHeaderInfo &next);
 const unsigned char *at_h264_next_start_code(const unsigned char *ptr, const unsigned char *limit);
 const char *at_h264_slice_type_description(int type);

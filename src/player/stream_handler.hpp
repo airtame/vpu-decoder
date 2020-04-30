@@ -8,7 +8,7 @@
 #pragma once
 
 #include "stream.hpp"
-#include "vpu_decoding_session.hpp"
+#include "vpu_output_frame.hpp"
 
 namespace airtame {
 class StreamHandler {

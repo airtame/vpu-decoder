@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019  AIRTAME ApS
+ * Copyright (c) 2019-2020  AIRTAME ApS
  * All Rights Reserved.
  *
  * See LICENSE.txt for further information.
@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "h264_stream_parser.hpp"
+#include "pack_queue.hpp"
 #include "simple_logger.hpp"
 #include "stream_handler.hpp"
 #include "vpu_decoder.hpp"
@@ -15,23 +17,24 @@ namespace airtame {
 class H264StreamHandler : public StreamHandler {
 private:
     SimpleLogger m_logger;
-    IVPUDecoder *m_decoder = nullptr;
     size_t m_number_of_display_frames;
-    bool m_wait_for_frames;
+    PackQueue m_packs;
+    H264StreamParser m_parser;
+    VPUDecoder m_decoder;
+    VPUOutputFrame m_decoded_frame;
+    size_t m_fake_timestamp = 0;
 
 public:
-    H264StreamHandler(Stream &stream, bool wait_for_frames)
+    H264StreamHandler(Stream &stream)
         : StreamHandler(stream)
         , m_number_of_display_frames(2)
-        , m_wait_for_frames(wait_for_frames)
+        , m_parser(m_logger, m_packs, false)
+        , m_decoder(m_logger, m_number_of_display_frames)
     {
     }
 
     virtual ~H264StreamHandler()
     {
-        if (m_decoder) {
-            delete m_decoder;
-        }
     }
 
     void offset(size_t off);
@@ -39,5 +42,8 @@ public:
     bool step();
     void swap();
     bool is_interleaved();
+
+private:
+    bool load_nal();
 };
 }

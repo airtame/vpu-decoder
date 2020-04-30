@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 extern "C" {
 #include <vpu_io.h>
@@ -22,6 +23,7 @@ extern "C" {
 #include "ivf.h"
 #include "jpeg_parser.hpp"
 #include "stream.hpp"
+#include "h264_nal.hpp"
 #include "h264_stream_handler.hpp"
 #include "jpeg_stream_handler.hpp"
 #include "vp8_stream_handler.hpp"
@@ -33,7 +35,7 @@ double get_timestamp()
     return (double)current.tv_sec + ((double)current.tv_usec / 1000000.0);
 }
 
-airtame::StreamHandler *produce_handler(airtame::Stream &stream, bool wait_for_frames)
+airtame::StreamHandler *produce_handler(airtame::Stream &stream)
 {
     const unsigned char *read_pointer = stream.get_read_pointer();
     /* Try to detect stream type */
@@ -44,7 +46,7 @@ airtame::StreamHandler *produce_handler(airtame::Stream &stream, bool wait_for_f
         fprintf(stderr, "\tIVF magic number detected\n");
         if (!::memcmp(read_pointer + 8, IVF_VP8_FOURCC, 4)) {
             fprintf(stderr, "\tVP8 content detected\n");
-            return new airtame::VP8StreamHandler(stream, wait_for_frames);
+            return new airtame::VP8StreamHandler(stream);
         } else {
             fprintf(stderr, "\tFOURCC code in IVF stream is not VP8");
             return nullptr;
@@ -67,7 +69,7 @@ airtame::StreamHandler *produce_handler(airtame::Stream &stream, bool wait_for_f
 
     /* OK, finally try scanning for h264 start code */
     if (at_h264_next_start_code(read_pointer, read_pointer + stream.get_size_left())) {
-        return new airtame::H264StreamHandler(stream, wait_for_frames);
+        return new airtame::H264StreamHandler(stream);
     }
 
     /* Couldn't recognize stream type */
@@ -135,7 +137,7 @@ bool start_display(void *g2d, airtame::G2DDisplay &display,
     size_t side = ::ceil(::sqrt(handlers.size()));
     size_t n = 0;
 
-    for (auto h = handlers.begin(); h != handlers.end(); h++) {
+    for (auto h : handlers) {
         /* Compute matrix coordinates of this handler first */
         size_t j = n / side;
         size_t i = n - (j * side);
@@ -143,24 +145,24 @@ bool start_display(void *g2d, airtame::G2DDisplay &display,
 
         /* Source frame description (NV12 data from VPU decoder) */
         g2d_surface src;
-        src.format = (*h)->is_interleaved() ? G2D_NV12 : G2D_I420;
-        src.planes[0] = (*h)->get_last_frame().dma->phy_addr;
-        src.planes[1] = (*h)->get_last_frame().dma->phy_addr
-            + ((*h)->get_last_frame().geometry.m_padded_width
-               * (*h)->get_last_frame().geometry.m_padded_height);
-        src.planes[2] = (*h)->is_interleaved() ? 0 : src.planes[1]
-            + ((*h)->get_last_frame().geometry.m_padded_width
-               * (*h)->get_last_frame().geometry.m_padded_height / 4);
-        src.left = (*h)->get_last_frame().geometry.m_crop_left;
-        src.top = (*h)->get_last_frame().geometry.m_crop_top;
-        src.right = (*h)->get_last_frame().geometry.m_crop_left
-            + (*h)->get_last_frame().geometry.m_true_width;
-        src.bottom = (*h)->get_last_frame().geometry.m_crop_top
-            + (*h)->get_last_frame().geometry.m_true_height;
+        src.format = h->is_interleaved() ? G2D_NV12 : G2D_I420;
+        src.planes[0] = h->get_last_frame().dma->phy_addr;
+        src.planes[1] = h->get_last_frame().dma->phy_addr
+            + (h->get_last_frame().geometry.m_padded_width
+               * h->get_last_frame().geometry.m_padded_height);
+        src.planes[2] = (h->is_interleaved() ? 0 : src.planes[1])
+            + (h->get_last_frame().geometry.m_padded_width
+               * h->get_last_frame().geometry.m_padded_height / 4);
+        src.left = h->get_last_frame().geometry.m_crop_left;
+        src.top = h->get_last_frame().geometry.m_crop_top;
+        src.right = h->get_last_frame().geometry.m_crop_left
+            + h->get_last_frame().geometry.m_true_width;
+        src.bottom = h->get_last_frame().geometry.m_crop_top
+            + h->get_last_frame().geometry.m_true_height;
         /* stride same as width, mb size aligned */
-        src.stride = (*h)->get_last_frame().geometry.m_padded_width;
-        src.width = (*h)->get_last_frame().geometry.m_padded_width;
-        src.height = (*h)->get_last_frame().geometry.m_padded_height;
+        src.stride = h->get_last_frame().geometry.m_padded_width;
+        src.width = h->get_last_frame().geometry.m_padded_width;
+        src.height = h->get_last_frame().geometry.m_padded_height;
         src.blendfunc = G2D_ONE;
         src.global_alpha = 255;
         src.clrcolor = 0;
@@ -174,8 +176,8 @@ bool start_display(void *g2d, airtame::G2DDisplay &display,
         cell.bottom = (j + 1) * cell.height / side;
 
         /* Scale our frame to sit within the cell, but with proper aspect ratio */
-        compute_scaling((*h)->get_last_frame().geometry.m_true_width,
-                        (*h)->get_last_frame().geometry.m_true_height,
+        compute_scaling(h->get_last_frame().geometry.m_true_width,
+                        h->get_last_frame().geometry.m_true_height,
                         cell);
 
         /* blit frame data into framebuffer. This is async operation - blitter
@@ -219,8 +221,6 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // TODO: make this cmd line arg one day?
-    bool wait_for_frames = true;
     std::list<airtame::StreamHandler *> handlers;
 
     /* Iterate over provided files, trying to create handlers for them */
@@ -242,7 +242,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        airtame::StreamHandler *handler = produce_handler(stream, wait_for_frames);
+        airtame::StreamHandler *handler = produce_handler(stream);
         if (handler) {
             handler->offset(offset);
             /* Success, stream recognized */
@@ -301,8 +301,8 @@ int main(int argc, char *argv[])
         /* Try to step all handlers, and see if at least one new frame is
          produced */
         new_frame = false;
-        for (auto h = handlers.begin(); h != handlers.end(); h++) {
-            if ((*h)->step()) {
+        for (auto h : handlers) {
+            if (h->step()) {
                 new_frame = true;
             }
         }
@@ -314,7 +314,6 @@ int main(int argc, char *argv[])
             ++frames;
         }
 
-
         /* Phase III: wait for the blit operation to finish */
         if (do_display) {
             end_display(g2d, display);
@@ -325,8 +324,8 @@ int main(int argc, char *argv[])
 
         /* Now we can get rid of displayed buffers. Interestingly so, this is
          not costless - it can take 1ms+ */
-        for (auto h = handlers.begin(); h != handlers.end(); h++) {
-            (*h)->swap();
+        for (auto h : handlers) {
+            h->swap();
         }
 
         double display_end = get_timestamp();

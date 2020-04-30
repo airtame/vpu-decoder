@@ -1,12 +1,11 @@
 /*
- * Copyright (c) 2018-2019  AIRTAME ApS
+ * Copyright (c) 2018-2020  AIRTAME ApS
  * All Rights Reserved.
  *
  * See LICENSE.txt for further information.
  */
 
 #include <assert.h>
-#include "h264_bitstream.hpp"
 #include "h264_stream_parser.hpp"
 
 /* H264Parser handles proper NAL-feeding for the decoder. This is because for
@@ -14,19 +13,33 @@
  that HW decoder we are using.
 
  This is because in H264 streams NALs compose "video sequences". Video sequence
- consists of picture slices, of which first should be IDR picture slice. IDR
- stands for "Instant Decoder Refresh", meaning that at this point decoder state
- can be properly (re)initialized using just this one picture.
+ consists of several pictures, of which first should be IDR picture. IDR stands
+ for "Instant Decoder Refresh", meaning that at this point decoder state can be
+ properly (re)initialized using just this one picture.
 
- But the problem is that IDR (and all other picture slices in H264) reference
- something called parameter sets. There are two kinds of these, sequence
- parameter set (SPS) and picture parameter set (PPS). They are kind of "context"
- messages that carry parameters common to whole video sequence (SPS) or one or
- more pictures (PPS). Now H264 standard allows those to be send anywhere in the
- stream, or indeed even out-of-band, provided that the proper SPS/PPS will be
- fed into decoder just before frame that refers to it.
+ Pictures are not single entities, but are subdivided into slices. Each picture
+ may be composed of one or more slices. And in fact this subdivision is our
+ first serious problem - in order to feed decoder properly, and to properly
+ assign metadata such as timestamp or rotation to the decoded frames we need to
+ know which picture slices make up which frame. In this version of the code it
+ was finally solved by parsing up slice headers.
 
- So for example stream continues, decoder sends out frames and between other
+ Unfortunately the only way to know that we have received all the slices that
+ make up current picture is to wait for first slice that starts next picture
+ (or sequence end, or stream end). As far as I know, there is no way for H264
+ to signal "this is last slice". All that is carried is frame identification, so
+ one waits for "begin of a next frame" to understand that previous frame has
+ ended.
+
+ Second problem is that picture slices in H264 reference something called
+ parameter sets. There are two kinds of these, sequence parameter set (SPS) and
+ picture parameter set (PPS). They are kind of "context" messages that carry
+ parameters common to whole video sequence (SPS) or one or more pictures (PPS).
+ Now H264 standard allows those to be send anywhere in the stream, or indeed
+ even out-of-band, provided that the proper SPS/PPS will be fed into decoder
+ just before frame that refers to it.
+
+ So for example stream goes on, decoder sends out frames and between other
  NALs fed it will get new SPS, which is not active just yet. "Old" sequence
  continues. Then after awhile IDR picture slice comes and refers that SPS, so
  current video sequence has to end.
@@ -42,84 +55,27 @@
 
 namespace airtame {
 
-/* Big problem with NAL parsing is this:
- - We know for sure that hw decoder works better if given separate, whole NALs
- one at a time (for example QSV stream gets decoded to single pixel (0,0) color
- all over the screen if NALs are not separated)
- - We also want as little delay as possible. Especially, we do not want to wait
- for the next input frame with feeding the data from the current one. But if we
- allowed for NALs spanning multiple frames we couldn't be sure whether current
- NAL ends with end of the frame, or extends in next one. So we would have to
- wait for the next frame, therefore inducing one (pipeline) frame delay.
- - Not to mention that handling fragmented NALs in decoder introduces great deal
- of complexity to already tricky code
+// TODO: this is for "Annex B", we could also have "AVCC"
 
- We control streaming done by ourselves, so in our stream multiple NALs may
- arrive "glued together" (like from QSV encoder), but newer "cut to pieces".
- Looks like current AirPlay/Tatvik also does this.
-
- So solution is this:
- - Assume that frames start with start code, and contain whole NALs (so NAL
- terminates on start code of next NAL or end of buffer)
- - Monitor if that assumption is true, and complain otherwise
- - For applications that don't naturally provide data as described above (like
- reading from file in imx_playback_video, or for example new version of AirPlay),
- introduce something BEFORE input of decoder module, that will make sure NALs
- are not in multiple buffers.
-
- This way, we can have most efficient and low-latency (also relatively simple)
- code in HW module for our own streaming, and complexity can be added where/if
- necessary.
-
- IMPORTANT:
-
- This parser does error handling on two levels. First thing is checking for
- start codes in process_buffer(). Second thing is concept of being "synchronized"
- with the stream (or not). This comes from H264 (and earlier MPEG standards)
- terminology of start codes "allowing for synchronization with the stream".
-
- Basic idea is that decoder can start reading incoming bit stream at any given
- place (OK, here we are in ordinary computer system and not serial link and so
- assume that bitstream is byte-aligned, but nothing more than that). Now, there
- are only one place (and that is IDR slice) where decoding can start. So parser
- starts with m_synchronized flag set to false. And in this mode:
- - PPS/SPS NALs are kept for future reference
- - On every IDR NAL we synchronize with the stream
- - Every other NAL is immediately thrown away.
-
- Of course, when m_synchronized is set, all NALs are fed into the decoder save
- from app-specific NALS. In this way, incoming stream can be insane (for example
- just B-frames) and we won't even try to feed that to decoder, we just consume
- NALs right away without doing nothing, in effect fast-forwarding the stream,
- looking for IDR image slice on which we can try to resynchronize.
-
- Procedure described above is good enough to allow for starting bitstream
- decoding at random offset - parser will simply keep skipping NALs until it
- accumulates enough SPS/PPSes and encounter IDR NAL it can decode.
-
- Note that this has nothing to do with decoder error handling - from decoder
- POV stream is valid if IDR NAL appears and both it, and all subsequent image
- slice NALs refer to some valid and known SPS/PPS pairs. Stream can still
- make no sense to decoder, which has its own error handling procedures */
-
-/* Uncomment this to log messages about NALs being fed to the decoder */
-//#define NAL_LOGGING
-
-size_t H264StreamParser::process_buffer(Timestamp timestamp, const unsigned char *data,
-                                        size_t length)
+// TODO: we could easily handle fragmented buffers now. It could help on
+// the user side too - right now we kinda have two parsers - very simple
+// one. To help with NALs broken by the buffer boundaries we could save
+// three "carry" bytes from the end of the buffer to next one. Could have
+// special field for that in Chunk/Pack
+void H264StreamParser::process_buffer(const VideoBuffer &buffer)
 {
-    const unsigned char *limit = data + length;
-    const unsigned char *current_nal = at_h264_next_start_code(data, limit);
+    const unsigned char *limit = buffer.data + buffer.size;
+    const unsigned char *current_nal = at_h264_next_start_code(buffer.data, limit);
     if (!current_nal) {
         /* No start code found, WTF is this? */
         codec_log_warn(m_logger,
                        "H264 parser given entire buffer without NAL "
                        "start code in it");
-        return go_out_of_sync() ? length : 0;
+        return;
     }
 
-    size_t bytes_consumed = current_nal - data;
-    if ((bytes_consumed > 1) || ((bytes_consumed == 1) && (data[0]))) {
+    size_t bytes_consumed = current_nal - buffer.data;
+    if ((bytes_consumed > 1) || ((bytes_consumed == 1) && (buffer.data[0]))) {
         /* Found start code, but it isn't very first thing in buffer, so
          issue a warning. It is OK for start code to be preceeded by one
          zero, though */
@@ -137,37 +93,19 @@ size_t H264StreamParser::process_buffer(Timestamp timestamp, const unsigned char
         const unsigned char *current_nal_limit = next_nal ? next_nal : limit;
         size_t current_nal_size = (size_t)(current_nal_limit - current_nal);
         /* Pass NAL to top level handler */
-        if (handle_nal(timestamp, current_nal, current_nal_size)) {
-            /* Decoder consumed this NAL, can move on */
-            bytes_consumed += current_nal_size;
-            current_nal = next_nal;
-        } else {
-            /* Decoder can't take this NAL right now, stop feeding */
-            break;
-        }
+        handle_nal(buffer.meta, current_nal, current_nal_size);
+        /* Decoder consumed this NAL, can move on */
+        bytes_consumed += current_nal_size;
+        current_nal = next_nal;
     }
 
-    return bytes_consumed;
+    /* IMPORTANT - attach free callback from the buffer to the chunks parsed
+     into video stream or we will "leak" this buffer */
+    m_frames.attach_free_callback(buffer.free_callback);
 }
 
-bool H264StreamParser::reset()
-{
-    if (m_decoder.reset()) {
-        m_synchronized = false;
-        m_activated_pps = m_activated_sps = -1;
-        for (size_t i = 0; i < H264_NUMBER_OF_SPS_ALLOWED; i++) {
-            m_sequence_parameter_sets[i].reset();
-        }
-        for (size_t i = 0; i < H264_NUMBER_OF_PPS_ALLOWED; i++) {
-            m_picture_parameter_sets[i].reset();
-        }
-        return true;
-    } else {
-        return false;
-    }
-}
-
-bool H264StreamParser::handle_nal(Timestamp timestamp, const unsigned char *nal, size_t size)
+void H264StreamParser::handle_nal(const std::shared_ptr<FrameMetaData> &meta,
+                                  const unsigned char *nal, size_t size)
 {
     /* Fourth byte of NAL (last byte of start code), five low bits are
      nal_unit_type */
@@ -177,87 +115,88 @@ bool H264StreamParser::handle_nal(Timestamp timestamp, const unsigned char *nal,
      it will be re-fed in the future */
     switch (type) {
         case NalType::UNSPECIFIED_ZERO: {
-            return handle_unspecified_nal(nal, size);
+            handle_unspecified_nal(nal, size);
+            return;
         }
 
-        /* Not subdivided slice */
-        case NalType::IDR_SLICE: {
-            return handle_idr_slice_nal(timestamp, nal, size);
-        }
-
-        /* Not subdivided slice */
         case NalType::NON_IDR_SLICE: {
-            return handle_non_idr_slice_nal(timestamp, nal, size);
+            handle_slice_nal(meta, nal, size, NalType::NON_IDR_SLICE);
+            return;
         }
 
-        /* This whole Partition A/B/C bussines is so encoder could subdivide
-         slices into up to three NALs. */
         case NalType::PARTITION_A_SLICE: {
-            /* Partition A is just a first part of subdivided slice, but just
-             like ordinary slice it starts with slice_header, so we can use
-             same routine */
-            return handle_non_idr_slice_nal(timestamp, nal, size);
+            handle_slice_nal(meta, nal, size, NalType::PARTITION_A_SLICE);
+            return;
+        }
+
+        case NalType::IDR_SLICE: {
+            handle_slice_nal(meta, nal, size, NalType::IDR_SLICE);
+            return;
         }
 
         case NalType::PARTITION_B_SLICE: {
-            return handle_bc_partition_nal(nal, size, NalType::PARTITION_B_SLICE);
+            handle_bc_partition_nal(nal, size, NalType::PARTITION_B_SLICE);
+            return;
         }
 
         case NalType::PARTITION_C_SLICE: {
-            return handle_bc_partition_nal(nal, size, NalType::PARTITION_C_SLICE);
+            handle_bc_partition_nal(nal, size, NalType::PARTITION_C_SLICE);
+            return;
         }
 
         case NalType::SUPPLEMENTAL_ENHANCED_INFORMATION: {
-            return handle_sei_nal(nal, size);
+            handle_sei_nal(nal, size);
+            return;
         }
 
         case NalType::SEQUENCE_PARAMETER_SET: {
-            return handle_sps_nal(nal, size);
+            handle_sps_nal(nal, size);
+            return;
         }
 
         case NalType::PICTURE_PARAMETER_SET: {
-            return handle_pps_nal(nal, size);
+            handle_pps_nal(nal, size);
+            return;
         }
 
         case NalType::ACCESS_UNIT_DELIMITER: {
-/* Just throw it away, they are not needed for decoding, and for example streams
- generated by Microsoft H264 software encoders tend to have a lot of these */
-#ifdef NAL_LOGGING
-            codec_log_debug(m_logger, "Access Unit Delimiter NAL ignored");
-#endif
-            return true;
+            /* Just throw it away, they are not needed for decoding, and for
+             example streams generated by Microsoft H264 software encoders tend
+             to have a lot of these */
+            return;
         }
 
         case NalType::END_OF_SEQUENCE: {
-            return handle_end_of_sequence_nal(nal, size);
+            handle_end_of_sequence_nal();
+            return;
         }
 
         case NalType::END_OF_STREAM: {
-            return handle_end_of_stream_nal(nal, size);
+            handle_end_of_stream_nal();
+            return;
         }
 
         case NalType::FILLER: {
             /* Just throw it away, this is just to pad network packets to
              constant size or some such */
-#ifdef NAL_LOGGING
-            codec_log_debug(m_logger, "Filler NAL ignored");
-#endif
-            return true;
+            return;
         }
 
         default: {
             if ((NalType::FIRST_RESERVED_TYPE <= type) && (type <= NalType::LAST_RESERVED_TYPE)) {
-                return handle_reserved_nal(nal, size);
+                handle_reserved_nal(nal, size);
+                return;
             } else if ((NalType::FIRST_UNSPECIFIED_TYPE <= type)
                        && (type <= NalType::LAST_UNSPECIFIED_TYPE)) {
-                return handle_unspecified_nal(nal, size);
+                handle_unspecified_nal(nal, size);
+                return;
             } else {
                 /* This should never happen, but to avoid infinite loop in
                  production environment, like "Twitch problem" of March 2019 */
                 codec_log_error(m_logger, "Unexpected NAL type %d, eating it up "
                                           "to avoid infinite loop", type);
                 assert(0); /* We want to notice in debug environments */
-                return true;
+                return;
             }
         }
     }
@@ -295,55 +234,28 @@ bool H264StreamParser::handle_nal(Timestamp timestamp, const unsigned char *nal,
  IMPORTANT: SPS are saved regardless of synchronized status, because on getting
  IDR slice we need to have at least one SPS/PPS to even think about syncing
  back */
-bool H264StreamParser::handle_sps_nal(const unsigned char *nal, size_t size)
+void H264StreamParser::handle_sps_nal(const unsigned char *nal, size_t size)
 {
-    // TODO: move to parsing SPS here, and giving cached parsed version to the
-    // decoders
-    /* We could just parse whole SPS here, but it doesn't make much sense
-     because most of the time it would be same o', so just read id out of
-     it (it is in fourth byte of payload), and then compare with existing
-     SPS with that id */
-    H264Bitstream bs(nal + 7, size - 7);
-    H264Bitstream::Result bits;
-    bits = bs.read_uev_bits();
-    if (bits.error) {
-        codec_log_error(m_logger,
-                        "Bitstream parse error while reading sps_id out "
-                        "of SPS");
-        return go_out_of_sync();
+    /* Parse SPS */
+    SpsNalInfo sps;
+    if (!at_h264_get_sps_info(nal, size, sps)) {
+        codec_log_error(m_logger, "Failed to parse SPS");
+        return;
     }
-
-    int sps_id = bits.value;
-    if ((sps_id < 0) || (sps_id >= H264_NUMBER_OF_SPS_ALLOWED)) {
-        codec_log_error(m_logger, "SPS parse error: sps_id out of range");
-        return go_out_of_sync();
-    }
+    int sps_id = sps.seq_parameter_set_id;
 
     /* OK, update SPS at sps_id */
-    if (m_sequence_parameter_sets[sps_id].update(nal, size, -1)) {
+    if (m_sequence_parameter_sets[sps_id].update(nal, size, -1, sps)) {
         /* Check currently active SPS */
-        if ((-1 != m_activated_sps) && (m_activated_sps == sps_id)) {
-            /* Will have to reactivate SPS, as currently active one
-                got replaced with different content. Technically this should
-                only happend on video sequence boundary, but it doesn't hurt
-                to handle it this way */
-            m_activated_sps = m_activated_pps = -1;
-#ifdef NAL_LOGGING
-            codec_log_debug(m_logger,
-                            "New SPS with id %d received, need "
-                            " reactivation of SPS/PPS pair",
-                            sps_id);
-#endif
-        } else { /* Just keep that SPS, nothing changes */
-#ifdef NAL_LOGGING
-            codec_log_debug(m_logger,
-                            "New SPS with id %d received and kept for "
-                            "future use",
-                            sps_id);
-#endif
-        }
+        int pps_id = m_current_picture_slice_header.pic_parameter_set_id;
+        const NALParameterSet<PpsNalInfo> &pps = m_picture_parameter_sets[pps_id];
+        if (pps.get_referred_index() == sps_id) {
+            /* Will have to reactivate SPS, as currently active one got replaced
+             with different content. Technically this should only happend on
+             video sequence boundary, but it doesn't hurt to handle it this way */
+            m_current_picture_slice_header.pic_parameter_set_id = -1;
+        } /* Just keep that SPS, nothing changes */
     }
-    return true;
 }
 
 /* See comments about SPS above and also, H264 standard: 7.4.2.2 on PPS:
@@ -354,59 +266,30 @@ bool H264StreamParser::handle_sps_nal(const unsigned char *nal, size_t size)
  seq_parameter_set_id shall be in the range of 0 to 31, inclusive.
 
  IMPORTANT: same as with SPS, we save PPS regardless of sync status */
-
-// TODO: create proper PPS parsing code analogous to SPS one
-bool H264StreamParser::handle_pps_nal(const unsigned char *nal, size_t size)
+void H264StreamParser::handle_pps_nal(const unsigned char *nal, size_t size)
 {
+    /* Parse PPS */
     PpsNalInfo pps;
     if (!at_h264_get_pps_info(nal, size, pps)) {
         codec_log_error(m_logger, "Failed to parse PPS");
-        return go_out_of_sync();
+        return;
     }
-
-    uint32_t sps_id = pps.seq_parameter_set_id;
-    uint32_t pps_id = pps.pic_parameter_set_id;
+    int sps_id = pps.seq_parameter_set_id;
 
     if (!m_sequence_parameter_sets[sps_id].get_size()) {
         codec_log_error(m_logger, "PPS parse error: sps_id refers to unknown SPS");
-        return go_out_of_sync();
+        return;
     }
+    int pps_id = pps.pic_parameter_set_id;
 
     /* OK, update PPS at pps_id */
-    if (m_picture_parameter_sets[pps_id].update(nal, size, sps_id)) {
+    if (m_picture_parameter_sets[pps_id].update(nal, size, sps_id, pps)) {
         /* PPS changed, see if it was active one */
-        if (m_activated_pps == pps_id) {
+        if (m_current_picture_slice_header.pic_parameter_set_id == pps_id) {
             /* Active PPS changed, next reference will require re-activation */
-            if (sps_id != m_activated_sps) { /* That PPS causes also activation of
-                                                different SPS */
-#ifdef NAL_LOGGING
-                codec_log_debug(m_logger,
-                                "New PPS with id %d and sps_id %d received "
-                                "This replaces currently active SPS/PPS "
-                                "and will cause reactivation of SPS/PPS",
-                                pps_id, sps_id);
-#endif
-                m_activated_sps = -1;
-            } else { /* Just PPS changes */
-#ifdef NAL_LOGGING
-                codec_log_debug(m_logger,
-                                "New PPS with id %d and sps_id %d received. "
-                                "This replaces currently active PPS and will "
-                                "need to be reactivated in its place",
-                                pps_id, sps_id);
-#endif
-            }
-            m_activated_pps = -1;
-        } else {
-#ifdef NAL_LOGGING
-            codec_log_debug(m_logger,
-                            "New PPS with id %d and sps_id %d received "
-                            "and kept for future use",
-                            pps_id, sps_id);
-#endif
+            m_current_picture_slice_header.pic_parameter_set_id = -1;
         }
     }
-    return true;
 }
 
 /* "An activated sequence parameter set RBSP shall remain active for the entire
@@ -422,127 +305,106 @@ bool H264StreamParser::handle_pps_nal(const unsigned char *nal, size_t size)
  well ignore buffering period SEI as a source of SPS activation, and just use
  IDR frame slice for that. Also, see comment before handle_sei_nal()
 
- Also, this frame is the only NAL which allows us to sync with stream, as, by
+ Also, this is the only NAL which allows us to sync with stream, as, by
  definition "After the decoding of an IDR picture all following coded pictures
  in decoding order can be decoded without inter prediction from any picture
  decoded prior to the IDR picture. The first picture of each coded video
  sequence is an IDR picture" */
-bool H264StreamParser::handle_idr_slice_nal(Timestamp timestamp, const unsigned char *nal,
-                                            size_t size)
+void H264StreamParser::handle_slice_nal(const std::shared_ptr<FrameMetaData> &meta,
+                                        const unsigned char *nal, size_t size,
+                                        NalType slice_type)
 {
-    NalType picture_type;
-    int slice_type, sps_id, pps_id;
-    if (!parse_slice_header(nal, size, picture_type, slice_type, sps_id, pps_id)) {
-        return go_out_of_sync();
+    /* One caveat here - if we are going to be fed by "random access" h264
+     stream, we could possibly mistaken _not first_ slice of IDR picture as
+     first one (should we jump right in the middle of multislice IDR picture).
+
+     BUT it should still be safe because then no SPS/PPS preceding IDR slices
+     will get received and processed, and parse_slice_header will fail with
+     lack of SPS/PPS error */
+    SliceHeaderInfo slice_header_info;
+    if (!parse_slice_header(nal, size, slice_header_info)) {
+        return;
     }
 
     /* Validity of SPS gets checked when reading PPS, so doesn't have to check
      now, and particular PPS needed is checked in parse_slice_header */
-    const NALParameterSet &sps = m_sequence_parameter_sets[sps_id];
-    const NALParameterSet &pps = m_picture_parameter_sets[pps_id];
-
-    /* Now feed all three NALs to the decoder */
-    // TODO: this only on FIRST SLICE OF IDR PICTURE, NOT ALL OF THEM!
-    if (m_decoder.feed_picture_slice_with_parameter_sets(
-            timestamp, sps.get_data(), sps.get_size(), pps.get_data(), pps.get_size(), nal, size,
-            true, m_activated_sps != sps_id, m_activated_pps != pps_id)) {
-        /* SPS/PPS/IDR picture slice consumed, sequence opened succesfully */
-        m_activated_sps = sps_id;
-        m_activated_pps = pps_id;
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "IDR picture slice_type %s size %zu ts " PRIi64 " fed into decoder",
-                        at_h264_slice_type_description(slice_type), size, timestamp);
-#endif
-        if (!m_synchronized) {
-            codec_log_info(m_logger, "Parser resynchronized with input stream");
-            m_synchronized = true;
+    int pps_id = slice_header_info.pic_parameter_set_id;
+    const NALParameterSet<PpsNalInfo> &pps = m_picture_parameter_sets[pps_id];
+    int sps_id = pps.get_referred_index();
+    const NALParameterSet<SpsNalInfo> &sps = m_sequence_parameter_sets[sps_id];
+    const char *description;
+    if (at_h264_are_different_pictures(m_current_picture_slice_header,
+                                       slice_header_info)) {
+        /* FIRST SLICE of new frame, gotta switch frames */
+        m_current_picture_slice_header = slice_header_info;
+        /* Start a new frame */
+        m_frames.push_new_pack();
+        m_frames.back().m_codec_type = CodecType::H264;
+        m_frames.back().m_geometry
+            = FrameGeometry(sps.get_info().padded_frame_width, sps.get_info().padded_frame_height,
+                            sps.get_info().true_frame_width, sps.get_info().true_frame_height,
+                            sps.get_info().true_crop_offset_left, sps.get_info().true_crop_offset_top);
+        // TODO: write down description about how it is enough to have as many,
+        // and how our decoder wants +2
+        m_frames.back().m_maximum_number_of_reference_frames = sps.get_info().num_ref_frames + 2;
+        m_frames.back().m_can_be_dropped = slice_header_info.ref_nal_idc ? false : true;
+        m_frames.back().m_is_complete = false;
+        m_frames.back().meta = meta;
+        // TODO: use profile from SPS to set this properly! Right now setting
+        // reordering for all H264 streams which is far from optimal. Have override
+        // to disable reordering for realtime streaming as well!
+        m_frames.back().m_needs_reordering = m_force_disable_reordering ? false : true;
+        m_frames.back().m_needs_flushing = false;
+        if (NalType::IDR_SLICE == slice_type) {
+            /* IDR slice can reopen the decoder */
+            m_frames.back().m_can_reopen_decoding = true;
+            /* Note that we ALWAYS add SPS and PPS to FIRST IDR slice. This is
+             because we are not sure when decoder will decide to reopen itself,
+             we are just generating stream of frame packs. So always equip IDR
+             frame with both parameter sets */
+            m_frames.push_chunk(sps.get_data(), sps.get_size(), "SPS");
+            m_frames.push_chunk(pps.get_data(), pps.get_size(), "PPS");
+            description = "First IDR slice";
+        } else {
+            m_frames.back().m_can_reopen_decoding = false;
+            /* NON-IDR slices can only switch PPSes, see if it does so. Even if
+             it does, standard says that this PPS has to refer currently active
+             SPS so feed PPS only */
+            if (m_current_picture_slice_header.pic_parameter_set_id
+                    != slice_header_info.pic_parameter_set_id) {
+                m_frames.push_chunk(pps.get_data(), pps.get_size(), "PPS");
+            }
+            description = "First slice";
         }
-        return true;
     } else {
-        /* IDR picture slice not consumed yet, will have to re-feed */
-        return false;
+        /* Not first slice of a frame */
+        description = (NalType::IDR_SLICE == slice_type) ? "IDR slice" : "slice";
+        /* IMPORTANT: if frame is spread across multiple input video buffers,
+         they can have multiple metadata. This code will naturally use metadata
+         of the buffer that contained very first slice, but if if one wanted to
+         process multiple metadata properly, something like this could be used:
+
+         if (meta && (m_frames.back().meta != meta)) {
+            // for example append "new" metadata to "old"
+         }
+
+         But tread carefully here. Metadata of first slice (such as timestamp)
+         probably makes most sense anyway.
+         */
     }
-}
-
-/* Non-IDR images cannot change SPS and so won't require decoder reopening. They
- can change PPS (which contains things like quantizer params) though */
-bool H264StreamParser::handle_non_idr_slice_nal(Timestamp timestamp, const unsigned char *nal,
-                                                size_t size)
-{
-    NalType picture_type;
-    int slice_type, sps_id, pps_id;
-
-    /* This function will check PPS being referred for validity */
-    if (!parse_slice_header(nal, size, picture_type, slice_type, sps_id, pps_id)) {
-        return go_out_of_sync();
-    }
-
-    const char *picture_description
-        = NalType::PARTITION_A_SLICE == picture_type ? "Partition A" : "Non-IDR";
-
-    if (!m_synchronized) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "%s picture slice thrown away because out of sync",
-                        picture_description);
-#endif
-        return true; /* Consume this NAL, we have to skip all the way to
-                      IDR slice to resync */
-    }
-
-    /* Only IDR slices are allowed to change activated SPS */
-    if (m_activated_sps != sps_id) {
-        codec_log_error(m_logger,
-                        "%s picture slice refers to SPS id %d but SPS %d "
-                        "is activated!",
-                        picture_description, sps_id, m_activated_sps);
-        return go_out_of_sync();
-    }
-
-    const NALParameterSet &pps = m_picture_parameter_sets[pps_id];
-
-    /* Now feed two NALs to the decoder */
-    if (m_decoder.feed_picture_slice_with_parameter_sets(timestamp, nullptr, 0, pps.get_data(),
-                                                         pps.get_size(), nal, size,
-                                                         false, /* NOT IDR NAL! */
-                                                         false, /* Don't activate SPS */
-                                                         m_activated_pps != pps_id)) {
-        /* PPS/Non-IDR picture slice consumed, sequence opened succesfully */
-        m_activated_pps = pps_id;
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "%s picture slice_type %s size %zu ts " PRIi64 " fed into decoder",
-                        picture_description, at_h264_slice_type_description(slice_type), size,
-                        timestamp);
-#endif
-        return true;
-    } else {
-        /* Slice not consumed yet, will have to re-feed */
-        return false;
-    }
+    m_frames.push_chunk(nal, size, description);
 }
 
 /* This is just partition slice B or C, which continue from previous partition A
  slice, which contained header and was already accepted by decoder, because we
  got here, so nothing special to do */
-bool H264StreamParser::handle_bc_partition_nal(const unsigned char *nal, size_t size,
+void H264StreamParser::handle_bc_partition_nal(const unsigned char *nal, size_t size,
                                                NalType partition_type)
 {
-    if (!m_synchronized) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "Partition %s picture slice size %zu discarted",
-                        (NalType::PARTITION_B_SLICE == partition_type) ? "B" : "C", size);
-#endif
-        return true; /* Consume this NAL */
-    }
-    if (m_decoder.feed_other(nal, size)) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "Partition %s picture slice size %zu fed into decoder",
-                        (NalType::PARTITION_B_SLICE == partition_type) ? "B" : "C", size);
-#endif
-        return true;
-    } else {
-        /* Slice not consumed yet, will have to re-feed */
-        return false;
-    }
+    /* Append NAL to frame */
+    m_frames.push_chunk(nal, size,
+                        (NalType::PARTITION_B_SLICE == partition_type)
+                            ? "Partition B" : "Partition C");
 }
 
 /* Standard page 50:
@@ -562,74 +424,49 @@ bool H264StreamParser::handle_bc_partition_nal(const unsigned char *nal, size_t 
  So it looks like SEIs could be thrown away. Especially so that I was not able
  to find the stream which contained buffering period SEI and most of the stream
  seem to be without SEIs at all or contains SEI types irrelevant for our work
- (like some kind of markers). But in spirit of keeping compliance with old
- code (which fed everything), will feed SEIs, too.
- */
-bool H264StreamParser::handle_sei_nal(const unsigned char *nal, size_t size)
+ (like some kind of markers). */
+void H264StreamParser::handle_sei_nal(const unsigned char *nal, size_t size)
 {
-    if (!m_synchronized) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "SEI NAL size %zu discarted", size);
-#endif
-        return true; /* Consume this NAL */
-    }
-    if (m_decoder.feed_other(nal, size)) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "SEI NAL size %zu fed into decoder", size);
-#endif
-        return true;
-    } else {
-        return false;
-    }
+    /* So in the latest version of stream parsing the problem is this:
+     we recognize end of frame n only on first slice header of frame n + 1.
+     And also we recognize start of very first frame on very first slice.
+     But SEI and similar NALs are coming before first slice of the frame they
+     refer to. So when first NAL appears and it is SEI, we don't have frame on
+     queue yet. And when - after building a frame SEI that applies to the
+     subsequent frame shows up, we'd add it to the current frame.
+
+     This is not a huge problem - we could as well have a "cache" for special
+     elements like SEIs or reserved NALs, and add those to the cache, and put
+     that cache in front of frame every time begin of frame is detected. But
+     we can also throw these away */
+    (void)nal;
+    (void)size;
 }
 
 /* H264 standard: on the SEI, AUD, filler, ends of sequence, and end of stream:
  "No normative decoding process is specified for NAL units with nal_unit_type
  equal to 6, 9, 10, 11, and 12". Now, AUD and filler got ignored above. SEI
  we know to contain extensions that our decoder _may_ interpret even if there
- is no "normative decoding process". Ends of sequence and ends of stream are/can
- be used by our own code, so we give NALs in these classes to the decoder
- without extra handling.
+ is no "normative decoding process". We add flushing flag so we know we need
+ to get buffered frames from reordered sequence.
 */
-
-bool H264StreamParser::handle_end_of_stream_nal(const unsigned char *nal, size_t size)
+void H264StreamParser::handle_end_of_stream_nal()
 {
-    if (!m_synchronized) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "End of stream NAL discarted");
-#endif
-        return true; /* Consume this NAL */
-    }
-    /* Technically, we could switch synchronized flag off here, but in fact we
-     do carry SPS activation over separate sequences, which prevents us from
-     reopening the decoder if not necessary, so we de-sync only on errors and
-     keep synchronized on end of sequence. And BTW looks like nobody cares to
-     send end of sequence apart from our own imx_playback_video and tests. */
-    if (m_decoder.feed_end_of_stream(nal, size)) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "End of stream NAL fed into decoder");
-#endif
-        return true;
+    if (m_frames.empty()) {
+        codec_log_warn(m_logger, "End of stream NAL received but there is no "
+                                 "sequence to terminate");
     } else {
-        return false;
+        m_frames.back().m_needs_flushing = true;
     }
 }
 
-bool H264StreamParser::handle_end_of_sequence_nal(const unsigned char *nal, size_t size)
+void H264StreamParser::handle_end_of_sequence_nal()
 {
-    if (!m_synchronized) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "End of sequence NAL size %zu discarted", size);
-#endif
-        return true;
-    }
-    if (m_decoder.feed_other(nal, size)) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "End of sequence NAL size %zu fed into decoder", size);
-#endif
-        return true;
+    if (m_frames.empty()) {
+        codec_log_warn(m_logger, "End of sequence NAL received but there is no "
+                                 "sequence to terminate");
     } else {
-        return false;
+        m_frames.back().m_needs_flushing = true;
     }
 }
 
@@ -640,28 +477,13 @@ bool H264StreamParser::handle_end_of_sequence_nal(const unsigned char *nal, size
  this Recommendation | International Standard."
 
  BUT this is first versions of H264 standard, which was then changed (f.e. they
- added Fidelity Range Extensions that AirPlay uses and HW decoder handles) and
- so we are not sure how/if our HW decoder handles these, so it is better to leave
- this decision to it.
+ added Fidelity Range Extensions that AirPlay uses and HW decoder handles)
  */
-bool H264StreamParser::handle_reserved_nal(const unsigned char *nal, size_t size)
+void H264StreamParser::handle_reserved_nal(const unsigned char *nal, size_t size)
 {
-    if (!m_synchronized) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "Reserved NAL (unit_type %u) size %zu discarted", nal[3] & 0x1f,
-                      size);
-#endif
-        return true;
-    }
-    if (m_decoder.feed_other(nal, size)) {
-#ifdef NAL_LOGGING
-        codec_log_debug(m_logger, "Reserved NAL (unit_type %u) size %zu fed into decoder",
-                        nal[3] & 0x1f, size);
-#endif
-        return true;
-    } else {
-        return false;
-    }
+    /* See comment in handle_sei_nal() */
+    (void)nal;
+    (void)size;
 }
 
 /* H264 standard on the unspecified range:
@@ -679,46 +501,25 @@ bool H264StreamParser::handle_reserved_nal(const unsigned char *nal, size_t size
  assign them some NAL type unspecified in standard, and take them from here to
  their proper destination
  */
-bool H264StreamParser::handle_unspecified_nal(const unsigned char *nal, size_t size)
+void H264StreamParser::handle_unspecified_nal(const unsigned char *nal, size_t size)
 {
     /* Discard */
     (void)size;
     (void)nal;
-#ifdef NAL_LOGGING
-    codec_log_debug(m_logger, "Unspecified NAL (unit_type %u) size %zu discarted", nal[3] & 0x1f,
-                    size);
-#endif
-    return true;
 }
 
-bool H264StreamParser::go_out_of_sync()
-{
-    if (m_synchronized) {
-        /* Avoid repeating the message */
-        codec_log_error(m_logger,
-                        "H264 parser going out of sync till next IDR "
-                        "image slice");
-        m_synchronized = false;
-    }
-    return m_decoder.reset(); /* We may need to re-enter here many times */
-}
-
-/* WARNING: unlike previous functions this fuction does not return consumed
- flag but parser success/failure */
+/* This function returnes parser success/failure status */
 bool H264StreamParser::parse_slice_header(const unsigned char *slice_nal, size_t size,
-                                          NalType &picture_type, int &slice_type,
-                                          int &sps_id, int &pps_id)
+                                          SliceHeaderInfo &slice_header_info)
 {
-    SliceHeaderInfo slice_header_info;
+    ::memset(&slice_header_info, 0, sizeof(slice_header_info));
     if (!at_h264_get_initial_slice_header_info(slice_nal, size, slice_header_info)) {
         codec_log_error(m_logger, "Initial slice header parsing failed!");
         return false;
     }
 
-    slice_type = slice_header_info.slice_type;
-
-    pps_id = slice_header_info.pic_parameter_set_id;
-    const NALParameterSet &pps = m_picture_parameter_sets[pps_id];
+    int pps_id = slice_header_info.pic_parameter_set_id;
+    const NALParameterSet<PpsNalInfo> &pps = m_picture_parameter_sets[pps_id];
     if (!pps.get_size()) {
         codec_log_error(m_logger, "Slice header wants to activate unknown PPS");
         return false;
@@ -726,82 +527,16 @@ bool H264StreamParser::parse_slice_header(const unsigned char *slice_nal, size_t
 
     /* SPS itself was checked when PPS referred here by slice header was loaded,
      so no need for extra checks */
-    sps_id = pps.get_referred_index();
-    const NALParameterSet &sps = m_sequence_parameter_sets[sps_id];
-
-    // TODO: these should be cached to avoid re-parsing on every slice */
-    SpsNalInfo sps_info;
-    if (!at_h264_get_sps_info(m_sequence_parameter_sets[sps_id].get_data(),
-        m_sequence_parameter_sets[sps_id].get_size(), sps_info)) {
-        codec_log_error(m_logger, "SPS parser failure");
-        return false;
-    }
-
-    PpsNalInfo pps_info;
-    if (!at_h264_get_pps_info(m_picture_parameter_sets[pps_id].get_data(),
-        m_picture_parameter_sets[pps_id].get_size(), pps_info)) {
-        codec_log_error(m_logger, "PPS parser failure");
-        return false;
-    }
+    int sps_id = pps.get_referred_index();
 
     /* Now we can do full slice header parsing */
-    if (!at_h264_get_full_slice_header_info(slice_nal, size, sps_info, pps_info,
+    if (!at_h264_get_full_slice_header_info(slice_nal, size,
+                                            m_sequence_parameter_sets[sps_id].get_info(),
+                                            m_picture_parameter_sets[pps_id].get_info(),
                                             slice_header_info)) {
         codec_log_error(m_logger, "Full slice header parsing failed!");
         return false;
     }
-
-    char buf[16];
-    if (NalType::IDR_SLICE == slice_header_info.nal_unit_type) {
-        codec_log_info(m_logger, "IDR %spicture slice_type=%s idr_pic_id=%u, size = %zu",
-                       slice_header_info.ref_nal_idc ? "reference " : "",
-                       at_h264_slice_type_description(slice_header_info.slice_type),
-                       slice_header_info.idr_pic_id, size);
-    } else {
-        codec_log_info(m_logger, "%spicture slice type=%s size=%zu",
-                       slice_header_info.ref_nal_idc ? "reference " : "",
-                       at_h264_slice_type_description(slice_header_info.slice_type),
-                       size);
-    }
-
-    // Questions we want answered:
-    // 1) First slice of IDR picture. To check for it:
-    // - If it is IDR picture slice, and previous NAL wasn't
-    // - If it is IDR picture slice, and previous NAL was this as well but had
-    // different idr_pic_id. So we need "previous NAL" info
-
-    /* First thing we have to do is to make sure we maintain monotonic idr
-     picture id. Stream doesn't have to supply one, as standard says
-     (7.4.3 "Slice header semantics"):
-     "idr_pic_id identifies an IDR picture. The values of idr_pic_id in all
-     the slices of an IDR picture shall remain unchanged. When two consecutive
-     access units in decoding order are both IDR access units, the value of
-     idr_pic_id in the slices of the first such IDR access unit shall differ
-     from the idr_pic_id in the second such IDR access unit. The value of
-     idr_pic_id shall be in the range of 0 to 65535, inclusive" */
-    // not sure here, we need previous reference picture/previous idr picture?
-//    bool first_idr_slice = false;
-//    if (idr_unit_type) {
-//        if ((previous_nal != IDR_NAL) || (idr_pic_id != previous_idr_pic_id)) {
-//            first_idr_slice = true;
-//            ++monotonic_idr_picture_id;
-//            previous_idr_pic_id = idr_pic_id;
-//        }
-//    }
-
-    /* Picture order count decoding. There are three variants, depending on
-     pic_order_cnt_type equal to 0, 1 or 2. And for Mode 0 we need "previous
-     reference picture in decoding order" while for Mode 1/2 we need "previous
-     picture in decoding order" */
-
-//    if (0 == sps_info.pic_order_cnt_type) {
-//        if (idr_unit_type) {
-//            /* "If the current picture is an IDR picture, prevPicOrderCntMsb is
-//             set equal to 0 and prevPicOrderCntLsb is set equal to 0. */
-//            prevPicOrderCntMsb = prevPicOrderCntLsb = 0;
-//        }
-//    }
-
     return true;
 }
 }

@@ -1,3 +1,20 @@
+## Version 2.0
+
+After almost two years of using the library, it was heavily refactored. New features include:
+1) New interface, hopefully easier to use
+2) Library is split into stream parsers and actual decoders. This allows for things like pre-decode
+frame dropping, but also makes the code easier to read. Also integration with decode engines
+other than i.mx6 VPU is now possible.
+3) Numerous bugfixes, also work-arounds for VPU decoder problems with VP8 playback
+4) Multislice h264 streams are now handed properly, thanks to much more robust h264 parser
+5) Re-use of frames on decoder reopening allows for smoother playback with streams that
+change resolution every now and then
+
+Also, michal@airtame.com is now m.adamczak@gmail.com, and will try to continue development
+of the library further.
+
+This is original README for version 1.0
+
 ## Credits
 This work is heavily based upon libimxvpuapi (https://github.com/Freescale/libimxvpuapi) version 0.10.3. While there is little that remains from original code, we learned a great deal about how to "talk to the VPU" from libimxvpuapi sources. Note that this knowledge is not available elsewhere (for example VPU documentation we had access to ("i.MX 6Dual/6Quad VPU Application Programming Interface Linux Reference Manual") has nothing to say about many subjects, such as wrapping VP8 frames into IVF, or hack that lets one decode JPEGs on VPU). And so our work is very much "derived work". Hats off to original authors!
 
@@ -44,18 +61,18 @@ We started by cutting and pasting the parts of libimxvpuapi responsible for h264
 6) Finally, this is still in the early stage of the development, and we cannot provide any support. Please consider yourself warned.
 
 ## How to build and test
-`scripts/build.sh` should build the library and `vpu_playback` tool  
-One can use `vpu_playback` to play back raw "Annex B" h264 and IVF-wrapped VP8 streams, like that:  
-`vpu_playback framebuffer stream0[@offset0] [stream1[@offset1]]...`  
-So for example:  
-`vpu_playback /dev/fb0 annex_b.h264` will play back `annex_b.h264` on `/dev/fb0`  
-`vpu_playback /dev/fb0 annex_b.h264@400000` will do the same, but starting from offset `400000`  
-`vpu_playback /dev/fb0 annex_b.h264 vp8.ivf` will try to play back two streams at once  
+`scripts/build.sh` should build the library and `vpu_playback` tool
+One can use `vpu_playback` to play back raw "Annex B" h264 and IVF-wrapped VP8 streams, like that:
+`vpu_playback framebuffer stream0[@offset0] [stream1[@offset1]]...`
+So for example:
+`vpu_playback /dev/fb0 annex_b.h264` will play back `annex_b.h264` on `/dev/fb0`
+`vpu_playback /dev/fb0 annex_b.h264@400000` will do the same, but starting from offset `400000`
+`vpu_playback /dev/fb0 annex_b.h264 vp8.ivf` will try to play back two streams at once
 and so on.
 
 ## Authors
 
-Michal Adamczak (michal@airtame.com) - programming, testing, bugfixes  
-Pierre Fourgeaud (https://github.com/pierrefourgeaud) - code reviews, testing, bugfixes  
-Razvan Lar - code reviews, code structure suggestions, testing, bugfixes  
-Vasile Popescu - h264 bitstream and SPS parsing code  
+Michal Adamczak (michal@airtame.com) - programming, testing, bugfixes
+Pierre Fourgeaud (https://github.com/pierrefourgeaud) - code reviews, testing, bugfixes
+Razvan Lar - code reviews, code structure suggestions, testing, bugfixes
+Vasile Popescu - h264 bitstream and SPS parsing code

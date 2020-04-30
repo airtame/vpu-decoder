@@ -6,7 +6,7 @@ CMAKE_ARGS=""
 for arg in "$@"; do
     case $arg in
         -d|--debug)
-            CMAKE_ARGS="$CMAKE_ARGS -DBUILD_DEBUG=1"
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=Debug"
             ;;
         *)
             echo "Invalid argument"
@@ -15,10 +15,15 @@ for arg in "$@"; do
     esac
 done
 
+TOOLCHAIN=$AIRTAME_TOOLCHAIN
+SYSROOT=$AIRTAME_SYSROOT
+test -z $AIRTAME_TOOLCHAIN && TOOLCHAIN=$TOOLCHAIN_PATH
+test -z $AIRTAME_SYSROOT && SYSROOT=$SYSROOT_PATH
 
-# Sometimes SYSROOT_PATH is used, sometimes ROOTFS_PATH. Make sure both work.
-if [[ $ROOTFS_PATH && -z $SYSROOT_PATH ]]; then
-    export SYSROOT_PATH="$ROOTFS_PATH"
+
+# Sometimes AIRTAME_SYSROOT is used, sometimes ROOTFS_PATH. Make sure both work.
+if [[ $ROOTFS_PATH && -z $SYSROOT ]]; then
+    SYSROOT="$ROOTFS_PATH"
 fi
 
 # AIRTAME_VERSION should be set to sha_XXXXXX in development.
@@ -27,8 +32,9 @@ if [[ -z $AIRTAME_VERSION ]]; then
 fi
 
 # Add some extra cmake options when cross-compiling.
-if [[ $TOOLCHAIN_PATH ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchain.cmake"
+if [[ $TOOLCHAIN ]]; then
+    CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchain.cmake \
+                            -DAIRTAME_TOOLCHAIN=$TOOLCHAIN -DAIRTAME_SYSROOT=$SYSROOT"
 fi
 
 # Don't pollute the top-level dir with build files.

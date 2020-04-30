@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019  AIRTAME ApS
+ * Copyright (c) 2019-2020  AIRTAME ApS
  * All Rights Reserved.
  *
  * See LICENSE.txt for further information.
@@ -8,10 +8,11 @@
 #include "vp8_stream_handler.hpp"
 
 namespace airtame {
-VP8StreamHandler::VP8StreamHandler(Stream &stream, bool wait_for_frames)
+VP8StreamHandler::VP8StreamHandler(Stream &stream)
     : StreamHandler(stream)
     , m_number_of_display_frames(2)
-    , m_wait_for_frames(wait_for_frames)
+    , m_parser(m_logger, m_packs)
+    , m_decoder(m_logger, m_number_of_display_frames)
 {
     const unsigned char *read_pointer = m_stream.get_read_pointer();
     /* Read width, height and number of frames off file */
@@ -60,69 +61,33 @@ void VP8StreamHandler::offset(size_t off)
 
 bool VP8StreamHandler::init()
 {
-    m_decoder = createVP8Decoder(m_logger, m_number_of_display_frames,
-                                 m_wait_for_frames);
-    if (!m_decoder) {
-        fprintf(stderr, "Couldn't create VP8 decoder");
-        return false;
-    }
-    return m_decoder->init();
+    m_fake_timestamp = 0;
+    return true;
 }
 
 bool VP8StreamHandler::step()
 {
-    while (!m_decoder->has_output_frame()) {
-        if (end()) {
-            return false; /* No new frame */
+    /* Yeah, this is ALMOST copy-paste from h264 version and it could be done
+     in more clever, OO-way. But still, there might be some vp8-specific things
+     we might want to add, also this is just an example. */
+    while (!m_decoded_frame.has_data()) {
+        /* Create at least one frame pack loading subsequent frames */
+        while (!m_packs.has_pack_for_consumption() && load_frame()) ;
+
+        /* No need to check completion of frames, VP8 frames are always complete */
+
+        if (!m_packs.has_pack_for_consumption()) {
+            /* This is the end */
+            codec_log_info(m_logger, "Fed %zu packs, was given %zu decoded frames",
+                           m_packs.get_number_of_packs_popped(),
+                           m_decoder.get_number_of_frames_given());
+            return false;
         }
 
-        if (m_stream.get_size_left()) {
-            /* Make sure there is enough data for frame size */
-            if (m_stream.get_size_left() < 4) {
-                fprintf(stderr, "Unexpected end of stream");
-                m_stream.flush_bytes(m_stream.get_size_left());
-                continue;
-            }
-
-            /* Read in next frame size from frame header. We assume that stream
-             read pointer is always at the next frame as IVF/VP8 has no resync
-             features. */
-            const unsigned char *read_pointer = m_stream.get_read_pointer();
-            size_t frame_size = *(uint32_t *)read_pointer;
-            if ((frame_size + 12) <= m_stream.get_size_left()) {
-                // TODO: we are passing zero as timestamp, but IVF contains 64-bit
-                // timestamps just after frame size, so could extract them there
-                /* Feed in one NAL. We don't need to release the buffer in any way, so
-                 just count number of processed buffers */
-                auto count = [this]() {
-                    ++m_buffers_out;
-                };
-                VideoBuffer buffer;
-                buffer.timestamp = 0;
-                buffer.data = read_pointer + 12,
-                buffer.size = frame_size;
-                buffer.free_callback = count;
-                m_decoder->push_buffer(buffer);
-                ++m_buffers_in;
-
-                /* Move on stream */
-                m_stream.flush_bytes(frame_size + 12);
-            } else {
-                fprintf(stderr, "EOF inside of IVF frame");
-                m_stream.flush_bytes(m_stream.get_size_left());
-                continue;
-            }
-        }
-
-        /* Check if we should return frames. This doesn't do any harm if
-         decoder was opened in "don't wait for frames" mode. Do it only when
-         output queue is empty, or we miss some display frames */
-        if (m_decoder->have_to_return_all_output_frames() && !m_decoder->has_output_frame()
-            && m_last_frame.dma) {
-            m_decoder->return_output_frame(
-                m_last_frame.dma.get()->phy_addr
-            );
-            m_last_frame.dma.reset();
+        /* OK, have complete frame pack, can try to decode */
+        while (!m_decoded_frame.has_data() && m_decoder.has_frame_for_decoding()
+               && m_packs.has_pack_for_consumption()) {
+            m_decoded_frame = m_decoder.step(m_packs);
         }
     }
 
@@ -131,23 +96,59 @@ bool VP8StreamHandler::step()
 
 void VP8StreamHandler::swap()
 {
-    if (m_last_frame.dma && m_decoder->has_output_frame()) {
-        /* We have frame _and_ decoder has next frame ready, can return current
-         one */
-        m_decoder->return_output_frame(
-            m_last_frame.dma.get()->phy_addr
-        );
-    }
+    if (m_decoded_frame.has_data()) {
+        if (m_last_frame.dma) {
+            /* We have next frame to display, can give old one back */
+            m_decoder.return_output_frame(m_last_frame.dma.get()->phy_addr);
+        }
 
-    if (m_decoder->has_output_frame()) {
         /* Update m_last_frame */
-        m_last_frame = m_decoder->get_output_frame();
-        m_decoder->pop_output_frame();
+        m_last_frame = m_decoded_frame;
+        m_decoded_frame.reset();
     }
 }
 
 bool VP8StreamHandler::is_interleaved()
 {
     return true;
+}
+
+bool VP8StreamHandler::load_frame()
+{
+    /* Make sure we are not on EOF */
+    if (!m_stream.get_size_left()) {
+        return false;
+    }
+
+    /* Make sure there is enough data for frame size */
+    if (m_stream.get_size_left() < 4) {
+        codec_log_error(m_logger, "Unexpected end of stream");
+        m_stream.flush_bytes(m_stream.get_size_left());
+        return false;
+    }
+
+
+    /* Read in next frame size from frame header. We assume that stream read
+     pointer is always at the next frame as IVF/VP8 has no resync features. */
+    const unsigned char *read_pointer = m_stream.get_read_pointer();
+    size_t frame_size = *(uint32_t *)read_pointer;
+    if ((frame_size + 12) <= m_stream.get_size_left()) {
+        /* Wrap it up and send for processing */
+        VideoBuffer buffer;
+        buffer.data = read_pointer + 12;
+        buffer.size = frame_size;
+        // TODO: we are passing zero as timestamp, but IVF contains 64-bit
+        // timestamps just after frame size, so could extract them there
+        buffer.meta.reset(new FrameMetaData(m_fake_timestamp++));
+        m_parser.process_buffer(buffer);
+
+        /* Move on stream */
+        m_stream.flush_bytes(frame_size + 12);
+        return true;
+    } else {
+        fprintf(stderr, "EOF inside of IVF frame");
+        m_stream.flush_bytes(m_stream.get_size_left());
+        return false;
+    }
 }
 }

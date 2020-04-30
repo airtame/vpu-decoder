@@ -16,26 +16,21 @@ set (SOURCES
   src/lib/ivf.h
   src/lib/jpeg_parser.hpp
   src/lib/jpeg_parser.cpp
+  src/lib/pack_queue.hpp
   src/lib/timestamp.hpp
   src/lib/vp8_stream_parser.hpp
   src/lib/vp8_stream_parser.cpp
-  src/lib/vpu.hpp
-  src/lib/vpu.cpp
-  src/lib/vpu_bitstream_buffer_monitoring.cpp
-  src/lib/vpu_bitstream_buffer_monitoring.hpp
   src/lib/vpu_decoder_buffers.hpp
+  src/lib/vpu_frame_buffers.hpp
+  src/lib/vpu_frame_buffers.cpp
   src/lib/vpu_decoder.cpp
   src/lib/vpu_decoder.hpp
   src/lib/vpu_decoding_session.cpp
   src/lib/vpu_decoding_session.hpp
   src/lib/vpu_dma_pointer.cpp
   src/lib/vpu_dma_pointer.hpp
-  src/lib/vpu_h264_decoder.hpp
-  src/lib/vpu_h264_decoder.cpp
   src/lib/vpu_jpeg_decoder.hpp
   src/lib/vpu_jpeg_decoder.cpp
-  src/lib/vpu_vp8_decoder.hpp
-  src/lib/vpu_vp8_decoder.cpp
 )
 
 add_library (${TARGET_NAME} STATIC ${SOURCES})
@@ -43,6 +38,8 @@ add_library (${TARGET_NAME} STATIC ${SOURCES})
 project(vpu_playback)
 
 set (TARGET_NAME vpu_playback)
+set (WARNING_FLAGS "-Wall -Wpedantic -Werror -Wextra -Wsign-compare")
+set (CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} ${WARNING_FLAGS}")
 
 include_directories (${CMAKE_CURRENT_SOURCE_DIR}/src/lib)
 

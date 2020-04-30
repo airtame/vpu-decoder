@@ -7,9 +7,10 @@
 
 #include "h264_bitstream.hpp"
 #include "h264_nal.hpp"
-#include <cassert>
+#include <assert.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static bool at_h264_ignore_sps_fre_scaling_list(H264Bitstream &bs_parser, size_t size);
 
@@ -20,7 +21,7 @@ bool at_h264_get_nal_type(const unsigned char *data, size_t size, NalType &out_n
     }
 
     const unsigned char *nal_data = data;
-    unsigned char nal_unit_type_mask = 0b00011111; // First 5 lsb bits
+    unsigned char nal_unit_type_mask = 0x1f; // First 5 lsb bits
     size_t zero_byte_count = 0;
     while (nal_data[0] == 0x00) {
         nal_data++;
@@ -66,10 +67,12 @@ do {                                                                            
 
 bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &sps_info)
 {
+    memset(&sps_info, 0, sizeof(sps_info));
+
     // TODO: use bs_parser all along
     H264Bitstream::Result bits;
 
-    /* Skip the NAL sync units (0x00000001 or 0x000001 pattersn) */
+    /* Skip the NAL sync units (0x00000001 or 0x000001 pattern) */
     while (*data == 0x00) {
         data++;
         size--;
@@ -105,6 +108,8 @@ bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &sp
         case H264Profile::BASELINE:
         case H264Profile::MAIN:
         case H264Profile::EXTENDED:
+        case H264Profile::FRE_SCALABLE_BASELINE:
+        case H264Profile::FRE_SCALABLE_HIGH:
         case H264Profile::FRE_HIGH_PROFILE:
         case H264Profile::FRE_HIGH_PROFILE_10:
         case H264Profile::FRE_HIGH_PROFILE_422:
@@ -132,7 +137,9 @@ bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &sp
     /* WARNING: this is where ordinary and Fidelity Extensions Profiles diverge,
      consult H.264/AVC Reference Software for details (can be found by googling
      any of following flag names */
-    if ((H264Profile::FRE_HIGH_PROFILE == sps_info.profile_idc)
+    if ((H264Profile::FRE_SCALABLE_BASELINE == sps_info.profile_idc)
+        || (H264Profile::FRE_SCALABLE_HIGH == sps_info.profile_idc)
+        || (H264Profile::FRE_HIGH_PROFILE == sps_info.profile_idc)
         || (H264Profile::FRE_HIGH_PROFILE_10 == sps_info.profile_idc)
         || (H264Profile::FRE_HIGH_PROFILE_422 == sps_info.profile_idc)
         || (H264Profile::FRE_HIGH_PROFILE_444 == sps_info.profile_idc)
@@ -146,6 +153,7 @@ bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &sp
         if (3 == chroma_format_idc) {
             bits = bs_parser.read_un_bits(1); // separate_colour_plane_flag
             RETURN_IF_ERROR(bits);
+            sps_info.separate_colour_plane_flag = bits.value;
         }
         bits = bs_parser.read_uev_bits(); // bit_depth_luma_minus8
         RETURN_IF_ERROR(bits);
@@ -153,7 +161,7 @@ bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &sp
         bits = bs_parser.read_uev_bits(); // bit_depth_chroma_minus8
         RETURN_IF_ERROR(bits);
 
-        bits = bs_parser.read_un_bits(1); // lossless_qprime_y_zero_flag
+        bits = bs_parser.read_un_bits(1); // qpprime_y_zero_transform_bypass_flag
         RETURN_IF_ERROR(bits);
 
         bits = bs_parser.read_un_bits(1); // seq_scaling_matrix_present_flag
@@ -304,6 +312,7 @@ bool at_h264_get_sps_info(const unsigned char *data, size_t size, SpsNalInfo &sp
 }
 
 /* "Airtamized" code from H264/AVC reference software */
+// TODO: check against the new standard versions!
 static bool at_h264_ignore_sps_fre_scaling_list(H264Bitstream &bs_parser, size_t size)
 {
     H264Bitstream::Result bits;
@@ -323,10 +332,11 @@ static bool at_h264_ignore_sps_fre_scaling_list(H264Bitstream &bs_parser, size_t
 
 bool at_h264_get_pps_info(const unsigned char *data, size_t size, PpsNalInfo &pps_info)
 {
+    memset(&pps_info, 0, sizeof(pps_info));
     // TODO: use bs_parser all along
     H264Bitstream::Result bits;
 
-    /* Skip the NAL sync units (0x00000001 or 0x000001 pattersn) */
+    /* Skip the NAL sync units (0x00000001 or 0x000001 pattern) */
     while (*data == 0x00) {
         data++;
         size--;
@@ -340,6 +350,7 @@ bool at_h264_get_pps_info(const unsigned char *data, size_t size, PpsNalInfo &pp
     if (bits.error || bits.value != 0) { // the forbidden_zero_bit should always be 0
         return false;
     }
+
     bits = bs_parser.read_un_bits(2); // nal_ref_idc
     RETURN_IF_ERROR(bits);
 
@@ -347,6 +358,7 @@ bool at_h264_get_pps_info(const unsigned char *data, size_t size, PpsNalInfo &pp
     if (bits.error || bits.value != 0x8) {
         return false;
     }
+
 
     bits = bs_parser.read_uev_bits();
     RETURN_IF_ERROR(bits);
@@ -411,7 +423,7 @@ bool at_h264_get_pps_info(const unsigned char *data, size_t size, PpsNalInfo &pp
 
             uint32_t n = (uint32_t)::ceil(::log2(pps_info.num_slice_groups_minus1 + 1));
             for (uint32_t i = 0; i <= pps_info.pic_size_in_map_units_minus1; i++) {
-                bits = bs_parser.read_un_bits(n);
+                bits = bs_parser.read_un_bits(n); /* slice_group_id[i] */
             }
         }
     }
@@ -457,6 +469,7 @@ bool at_h264_get_pps_info(const unsigned char *data, size_t size, PpsNalInfo &pp
 static bool at_h264_get_initial_slice_header_info_implementation(H264Bitstream &bs_parser,
                                                                  SliceHeaderInfo &slice_header_info)
 {
+    memset(&slice_header_info, 0, sizeof(slice_header_info));
     /* Skip zeroed out bytes  */
     H264Bitstream::Result bits = bs_parser.read_un_bits(8);
     while (!bits.error && !bits.value) {
@@ -482,6 +495,8 @@ static bool at_h264_get_initial_slice_header_info_implementation(H264Bitstream &
     bits = bs_parser.read_un_bits(5); /* nal_unit_type */
     RETURN_IF_ERROR(bits);
     slice_header_info.nal_unit_type = (NalType)bits.value;
+    slice_header_info.IdrPicFlag
+        = NalType::IDR_SLICE == slice_header_info.nal_unit_type ? true : false;
 
     bits = bs_parser.read_uev_bits(); /* first_mb_in_slice, ignore */
     RETURN_IF_ERROR(bits);
@@ -496,8 +511,8 @@ static bool at_h264_get_initial_slice_header_info_implementation(H264Bitstream &
      so just "unwrap" it here */
     slice_header_info.h264_slice_type
         = H264SliceType((slice_header_info.slice_type < 5)
-            ? slice_header_info.slice_type
-            : slice_header_info.slice_type - 5);
+                        ? slice_header_info.slice_type
+                        : slice_header_info.slice_type - 5);
 
     bits = bs_parser.read_uev_bits(); /* pic_parameter_set_id */
     RETURN_IF_ERROR(bits);
@@ -517,71 +532,18 @@ bool at_h264_get_initial_slice_header_info(const unsigned char *data, size_t siz
     return at_h264_get_initial_slice_header_info_implementation(bs_parser, slice_header_info);
 }
 
-/* Very same syntax element (save for variable name postfixes occures twice
- and all we want is to skim over it properly. See 7.3.3.1 "Reference picture
- list reordering syntax" */
-static bool at_h264_skip_ref_pic_list_reordering(H264Bitstream &bs_parser)
-{
-    H264Bitstream::Result bits = bs_parser.read_un_bits(1);
-    RETURN_IF_ERROR(bits);
-    bool ref_pic_list_reordering_flag_lx = bits.value ? true : false;
+/* This split into initial and full slice header info functions stems from
+ chicken-and-egg problem of interpreting slice header, because:
+ - To fully interpret the slice header info one needs SPS and PPS information
+ - But to get SPS and PPS proper for the slice header one needs to parse first
+ part of the slice header.
+ Because in our code structure SPSes and PPSes are held elsewhere, and this
+ code is just functional-style utilities, there are two functions, first one
+ is called to get basic info up to SPS and PPS id, and second one is called
+ with apropriate SPS/PPS to get full header info.
 
-    if (ref_pic_list_reordering_flag_lx) {
-        uint32_t reordering_of_pic_nums_idc;
-        do {
-            bits = bs_parser.read_uev_bits();
-            RETURN_IF_ERROR(bits);
-            reordering_of_pic_nums_idc = bits.value;
-
-            if ((0 == reordering_of_pic_nums_idc)
-                || (1 == reordering_of_pic_nums_idc)) {
-                bits = bs_parser.read_uev_bits(); /* abs_diff_pic_num_minus1 */
-                RETURN_IF_ERROR(bits);
-            } else if (2 == reordering_of_pic_nums_idc) {
-                bits = bs_parser.read_uev_bits(); /* long_term_pic_num */
-                RETURN_IF_ERROR(bits);
-            }
-        } while(3 != reordering_of_pic_nums_idc);
-    }
-    return true;
-}
-
-static bool at_h264_skip_pred_weigh_table(H264Bitstream &bs_parser,
-                                          uint32_t num_ref_idx_lx_active_minus1)
-{
-    H264Bitstream::Result bits;
-
-    for (uint32_t i = 0; i <= num_ref_idx_lx_active_minus1; i++) {
-        bits = bs_parser.read_un_bits(1);
-        RETURN_IF_ERROR(bits);
-        bool luma_weight_lx_flag = bits.value ? true : false;
-
-        if (luma_weight_lx_flag) {
-            bits = bs_parser.read_sev_bits(); /* luma_weight_lx[i] */
-            RETURN_IF_ERROR(bits);
-
-            bits = bs_parser.read_sev_bits(); /* luma_offset_lx[i] */
-            RETURN_IF_ERROR(bits);
-        }
-
-        bits = bs_parser.read_un_bits(1);
-        RETURN_IF_ERROR(bits);
-        bool chroma_weight_lx_flag = bits.value ? true : false;
-
-        if (chroma_weight_lx_flag) {
-            for (size_t j = 0; j < 2; j++) {
-                bits = bs_parser.read_sev_bits(); /* chroma_weight_lx[i][j] */
-                RETURN_IF_ERROR(bits);
-
-                bits = bs_parser.read_sev_bits(); /* chroma_offset_lx[i][j] */
-                RETURN_IF_ERROR(bits);
-            }
-        }
-    }
-
-    return true;
-}
-
+ Also please see comment around at_h264_are_different_pictures()
+ */
 bool at_h264_get_full_slice_header_info(const unsigned char *data, size_t size,
                                         const SpsNalInfo &sps, const PpsNalInfo &pps,
                                         SliceHeaderInfo &slice_header_info)
@@ -594,7 +556,13 @@ bool at_h264_get_full_slice_header_info(const unsigned char *data, size_t size,
     H264Bitstream::Result bits;
 
     /* at_h264_get_initial_slice_header_info reads up to (including)
-     pic_parameter_set_id so the next field in stream is frame_num */
+     pic_parameter_set_id so the next field in stream is optional
+     colour_plane_id */
+    if (sps.separate_colour_plane_flag) {
+        bits = bs_parser.read_un_bits(2); /* colour_plane_id */
+        RETURN_IF_ERROR(bits);
+    }
+
     bits = bs_parser.read_un_bits(sps.log2_max_frame_num_minus4 + 4); /* frame_num */
     RETURN_IF_ERROR(bits);
     slice_header_info.frame_num = bits.value;
@@ -618,6 +586,9 @@ bool at_h264_get_full_slice_header_info(const unsigned char *data, size_t size,
         slice_header_info.idr_pic_id = bits.value;
     }
 
+    /* Initialize these to safe values */
+    slice_header_info.pic_order_cnt_lsb = 0;
+    slice_header_info.delta_pic_order_cnt_bottom = 0;
     if (0 == sps.pic_order_cnt_type) {
         /* pic_order_cnt_lsb */
         bits = bs_parser.read_un_bits(sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
@@ -631,6 +602,9 @@ bool at_h264_get_full_slice_header_info(const unsigned char *data, size_t size,
         }
     }
 
+    /* Initialize these to safe values */
+    slice_header_info.delta_pic_order_cnt[0] = 0;
+    slice_header_info.delta_pic_order_cnt[1] = 0;
     if ((1 == sps.pic_order_cnt_type)
         && !sps.delta_pic_order_always_zero_flag) {
         bits = bs_parser.read_sev_bits(); /* delta_pic_order_cnt[0] */
@@ -644,147 +618,104 @@ bool at_h264_get_full_slice_header_info(const unsigned char *data, size_t size,
         }
     }
 
+    slice_header_info.redundant_pic_cnt = 0;
     if (pps.redundant_pic_cnt_present_flag) {
         bits = bs_parser.read_uev_bits();
         RETURN_IF_ERROR(bits);
         slice_header_info.redundant_pic_cnt = bits.value;
     }
 
-    if (H264SliceType::B == slice_header_info.h264_slice_type) {
-        bits = bs_parser.read_un_bits(1); /* direct_spatial_mv_pred_flag */
-        RETURN_IF_ERROR(bits);
-    }
-
-    /* "num_ref_idx_active_override_flag equal to 0 specifies that the values
-     of the syntax elements num_ref_idx_l0_active_minus1 and
-     num_ref_idx_l1_active_minus1 specified in the referred picture parameter
-     set are in effect. num_ref_idx_active_override_flag equal to 1 specifies
-     that the num_ref_idx_l0_active_minus1 and num_ref_idx_l1_active_minus1
-     specified in the referred picture parameter set are overridden for the
-     current slice (and only for the current slice) by the following values in
-     the slice header" */
-
-    /* So copy defaults first... */
-    slice_header_info.num_ref_idx_l0_active_minus1
-        = pps.num_ref_idx_l0_active_minus1;
-    slice_header_info.num_ref_idx_l1_active_minus1
-        = pps.num_ref_idx_l1_active_minus1;
-
-    if ((H264SliceType::P == slice_header_info.h264_slice_type)
-        || (H264SliceType::SP == slice_header_info.h264_slice_type)
-        || (H264SliceType::B == slice_header_info.h264_slice_type)) {
-        bits = bs_parser.read_un_bits(1);
-        RETURN_IF_ERROR(bits);
-        bool num_ref_idx_active_override_flag = bits.value ? true : false;
-
-        /* ...and then check if we should override them */
-        if (num_ref_idx_active_override_flag) {
-            bits = bs_parser.read_uev_bits(); /* num_ref_idx_l0_active_minus1 */
-            RETURN_IF_ERROR(bits);
-            slice_header_info.num_ref_idx_l0_active_minus1 = bits.value;
-
-            if (H264SliceType::B == slice_header_info.h264_slice_type) {
-                bits = bs_parser.read_uev_bits(); /* num_fer_idx_l1_active_minus1 */
-                RETURN_IF_ERROR(bits);
-                slice_header_info.num_ref_idx_l1_active_minus1 = bits.value;
-            }
-        }
-    }
-
-    /* Here goes whole ref_pic_list_reordering() syntax element. We read it just
-     to get further, no interest in this data yet. Note that I and SI pictures
-     have zero elements, B pictures have two and all others have one, so I
-     presume these are for forward/backward prediction */
-    if ((H264SliceType::I != slice_header_info.h264_slice_type)
-        && (H264SliceType::SI != slice_header_info.h264_slice_type)) {
-        if (!at_h264_skip_ref_pic_list_reordering(bs_parser)) {
-            return false;
-        }
-    }
-
-    if (H264SliceType::B == slice_header_info.h264_slice_type) {
-        if (!at_h264_skip_ref_pic_list_reordering(bs_parser)) {
-            return false;
-        }
-    }
-
-    /* Here goes pred_weight_table() syntax element. Just like above, we want to
-     skip it */
-    if ((pps.weighted_pred_flag
-         && ((H264SliceType::P == slice_header_info.h264_slice_type)
-             || H264SliceType::SP == slice_header_info.h264_slice_type))
-        || ((1 == pps.weighted_bipred_idc)
-            && (H264SliceType::B == slice_header_info.h264_slice_type))) {
-        bits = bs_parser.read_uev_bits(); /* luma_log2_weight_denom */
-        RETURN_IF_ERROR(bits);
-
-        bits = bs_parser.read_uev_bits(); /* chroma_log2_weight_denom */
-        RETURN_IF_ERROR(bits);
-
-        if (!at_h264_skip_pred_weigh_table(bs_parser,
-                                           slice_header_info.num_ref_idx_l0_active_minus1)) {
-            return false;
-        }
-
-        if (H264SliceType::B == slice_header_info.h264_slice_type) {
-            if (!at_h264_skip_pred_weigh_table(bs_parser,
-                                               slice_header_info.num_ref_idx_l1_active_minus1)) {
-                return false;
-            }
-        }
-    }
-
-    if (slice_header_info.ref_nal_idc) {
-        /* This is dec_ref_pic_marking() syntax element, last one we want to
-         retrieve now, to get memory_management_control_operation */
-        if (NalType::IDR_SLICE == slice_header_info.nal_unit_type) {
-            /* Call it a day, IDR slices don't contain memory management */
-        } else {
-            bits = bs_parser.read_un_bits(1);
-            RETURN_IF_ERROR(bits);
-            bool adaptive_ref_pic_marking_mode_flag = bits.value ? true : false;
-            uint32_t memory_management_control_operation = 0;
-            slice_header_info.had_memory_management_control_operation_equal_to_5 = false;
-            if (adaptive_ref_pic_marking_mode_flag) {
-                do {
-                    bits = bs_parser.read_uev_bits();
-                    RETURN_IF_ERROR(bits);
-                    memory_management_control_operation = bits.value;
-
-                    if ((1 == memory_management_control_operation)
-                        || (3 == memory_management_control_operation)) {
-                        bits = bs_parser.read_uev_bits(); /* difference_of_pic_nums_minus_1 */
-                        RETURN_IF_ERROR(bits);
-                    }
-
-                    if (2 == memory_management_control_operation) {
-                        bits = bs_parser.read_uev_bits(); /* long_term_pic_num */
-                        RETURN_IF_ERROR(bits);
-                    }
-
-                    if ((3 == memory_management_control_operation)
-                        || (6 == memory_management_control_operation)) {
-                        bits = bs_parser.read_uev_bits(); /* long_term_frame_idx */
-                        RETURN_IF_ERROR(bits);
-                    }
-
-                    if (4 == memory_management_control_operation) {
-                        bits = bs_parser.read_uev_bits(); /* max_long_term_frame_idx_plus1 */
-                    }
-
-                    /* Some extra 200 or so lines of code are in essence for
-                     this! It is important condition and is used in many places,
-                     so OFC putting it close to begin of h264 slice header would
-                     make our life too easy :/ */
-                    if (5 == memory_management_control_operation) {
-                        slice_header_info.had_memory_management_control_operation_equal_to_5 = true;
-                    }
-                } while (memory_management_control_operation);
-            }
-        }
-    }
+    /* WARNING: there is plenty more to slice header syntax than this. And I had
+     all the code needed for pic_order_type (frame number taking into account
+     reordering) written and even working on some simple streams. But it was
+     a lot of extra code, and single bug there might cause us big headaches on
+     some exotic format/extension. So in the end I got rid of all that is not
+     strictly needed for at_h264_are_different_pictures() implementation. This
+     is safer for now */
 
     return true;
+}
+
+/* 7.4.1.2.4 explains how to tell where new _primary_ coded picture starts:
+ "frame_num differs in value. The value of frame_num used to test this condition
+ is the value of frame_num that appears in the syntax of the slice header (...)
+ – pic_parameter_set_id differs in value.
+ – field_pic_flag differs in value.
+ – bottom_field_flag is present in both and differs in value.
+ – nal_ref_idc differs in value with one of the nal_ref_idc values being equal
+ to 0.
+ – pic_order_cnt_type is equal to 0 for both and either pic_order_cnt_lsb
+ differs in value, or delta_pic_order_cnt_bottom differs in value.
+ – pic_order_cnt_type is equal to 1 for both and either delta_pic_order_cnt[ 0 ]
+ differs in value, or delta_pic_order_cnt[ 1 ] differs in value.
+ – IdrPicFlag differs in value.
+ – IdrPicFlag is equal to 1 for both and idr_pic_id differs in value."
+
+ As for redundant coded pictures:
+ "Slices and slice data partitions having the same value of redundant_pic_cnt
+ belong to the same coded picture. If the value of redundant_pic_cnt is equal
+ to 0, they belong to the primary coded picture; otherwise (the value of
+ redundant_pic_cnt is greater than 0), they belong to the same redundant coded
+ picture."
+
+ NOTE: this function is central to proper "per frame" processing of h264 stream.
+ This is because most important thing is to actually be able to tell frames
+ apart. They may be anything from single slice NAL up to some -teen slice NALs,
+ plus up to two parameter sets. And to run the decoder properly and efficiently,
+ we need to be able to assemble "whole frame".
+
+ So, in fact, A LOT of the code in this source file is written so that
+ SliceHeaderInfo can contain just enough information to tell frames apart.
+ Why this is important - h264 parsing is complicated. Standard is huge and there
+ are extensions not described there. So the less parsing we do, the better,
+ because chances that some exotic h264 syntax element fucks up decoding are
+ then lesser. Therefore, parsing of all the fields, but especiall slice headers
+ was cut down to the minimal form that delivers enough information here.
+ */
+bool at_h264_are_different_pictures(const SliceHeaderInfo &current,
+                                    const SliceHeaderInfo &next)
+{
+    /* Primary pictures checking */
+    if (current.frame_num != next.frame_num) {
+        return true;
+    }
+    if (current.pic_parameter_set_id != next.pic_parameter_set_id) {
+        return true;
+    }
+    if (current.field_pic_flag != next.field_pic_flag) {
+        return true;
+    }
+    if (current.bottom_field_flag != next.bottom_field_flag) {
+        return true;
+    }
+    if (current.ref_nal_idc != next.ref_nal_idc) {
+        return true;
+    }
+
+    /* Note that we are not checking pic_order_count_type - this is because
+     we initialize not used *pic_order_cnt* values to safe zeros, so they will
+     compare equal for all slices (and pic_order_count_type is set in SPS, so
+     common for whole sequence anyway) */
+    if ((current.pic_order_cnt_lsb != next.pic_order_cnt_lsb)
+        || (current.delta_pic_order_cnt_bottom != next.delta_pic_order_cnt_bottom)) {
+        return true;
+    }
+    if ((current.delta_pic_order_cnt[0] != next.delta_pic_order_cnt[0])
+        || (current.delta_pic_order_cnt[1] != next.delta_pic_order_cnt[1])) {
+        return true;
+    }
+    if (current.IdrPicFlag != next.IdrPicFlag) {
+        return true;
+    }
+    if (current.idr_pic_id != next.idr_pic_id) {
+        return true;
+    }
+
+    /* Redundant pictures checking */
+    if (current.redundant_pic_cnt != next.redundant_pic_cnt) {
+        return true;
+    }
+    return false;
 }
 
 const unsigned char *at_h264_next_start_code(const unsigned char *ptr, const unsigned char *limit)

@@ -1,102 +1,144 @@
-/*
- * Copyright (c) 2019  AIRTAME ApS
- * All Rights Reserved.
- *
- * See LICENSE.txt for further information.
- */
-
 #pragma once
-
-#include <functional>
 
 #include "codec_common.hpp"
 #include "codec_logger.hpp"
-#include "vpu_output_frame.hpp"
+#include "vpu_decoder_buffers.hpp"
+#include "vpu_frame_buffers.hpp"
+#include "vpu_decoding_session.hpp"
+#include "pack_queue.hpp"
 
 namespace airtame {
-    /* This is a interface class for VPU-based video stream decoders such as vp8
-     and h264 (and others should we ever decide to write them). Common interface
-     is required because controlling entity (such as Airtame pipeline module, or
-     perhaps Chromium wrapper) doesn't really want to know what kind of stream
-     it is handling, except perhaps when ordered to create particular subtype.
-     So instead of having to create some kind of polymorphical solution wherever
-     decoders are used, we provide one here */
-    class IVPUDecoder {
-    public:
-        virtual ~IVPUDecoder() {}
 
-        /* This function does real initialization of particular decoder instance
-         like opening VPU library, allocating DMA memory and so on, with ctors
-         providing only trivial stuff like setting initial values for members */
-        virtual bool init() = 0;
+/* The purpose of this class is to use low level VPUDecodingSession to implement
+ fully featured decoder. Hight level session/frame pack management is here */
+class VPUDecoder {
+private:
+    CodecLogger &m_logger;
+    size_t m_display_frames;
 
-        /* Use this function to push data into decoder. Buffers may contain
-         one or more _complete_ stream chunks (h265 NALs, VP8 frames, ...).
-         Fragments of chunks, or extra "trash" bytes are NOT allowed and will
-         cause errors. Function may be called at any time, regardless of what
-         decoder is doing. Calling it doesn't cause immediate feeding of the
-         decoder, it will merely enqueue data for future use when decoder
-         requests it. free_callback will be called once the whole buffer is
-         consumed and isn't needed anymore */
-        virtual void push_buffer(const VideoBuffer &buffer) = 0;
+    VPUDecoderBuffers m_buffers;
+    VPUFrameBuffers m_frames;
 
-        /* Use this function to return frame that is no longer needed. Usually
-         this will mean after it was displayed, or if all frames are being
-         requested back */
-        virtual void return_output_frame(unsigned long physical_address) = 0;
+    DecodingStats m_stats;
+    std::shared_ptr<VPUDecodingSession> m_session;
 
-        /* If wait_for_frames ctor argument was true, then decoder will wait
-         for all frames to return (via return_output_frame) before closing
-         current session (and allocating frames again for next session). This
-         conserves DMA memory usage and helps to reduce fragmentation, but isn't
-         possible in some situations.
+    size_t m_frames_given = 0;
+public:
+    VPUDecoder(CodecLogger &logger, size_t display_frames)
+        : m_logger(logger)
+        , m_display_frames(display_frames)
+        , m_frames(logger)
+    {
+    }
 
-         If that function returns true decoder will be able to continue ONLY
-         after all the frames that were popped out will get returned */
-        virtual bool have_to_return_all_output_frames() = 0;
+    /* It is safe to call this anyway, but for the step to actually do something
+     this->has_frame_for_decoding() and pack_queue.has_packs_for_consumption()
+     must both return true. So it should be called like this:
+     while (decoder.has_frame_for_decoding() && queue.has_packs_for_consumption()) {
+        VPUOutputFrame frame = decoder.step(queue);
+        if (frame.has_data()) {
+            // do something with the frame, then return it back once it is free
+        }
+     }
 
-        /* By calling this function user can force decoder flushing (i.e. force
-         output of all frames that have been buffered inside decoder). Callback
-         will get called once flush will complete */
-        using FlushCallback = std::function<void(void)>;
-        virtual void start_flushing(FlushCallback flush_callback) = 0;
+     Now, basically there are two possible outcomes from calling this function:
+     decoded frame is given for display or not (duh!). Also this function
+     guarantees that if has_frame_for_decoding() and has_packs_for_consumption()
+     both are true, SOMETHING is bound to happen, that is:
+     - Either frame is given for display
+     - One frame pack is taken off the queue
+     - (both can happen as well)
 
-        /* This returns true if underlying decoder has finished decoding of all
-         data that was pushed into it, got all the output frames back and shut
-         down. It is intended to use with tests, for example when we want to
-         push bitstream into decoder and test if all expected frames were
-         produced. Closing occurs automatically, so there is nothing like
-         "do close" counterpart. Also, this is probably not needed for anything
-         other than testing. */
-        virtual bool is_closed() const = 0;
+     More precisely, reasons for not giving the frame for display can be:
+     - No frame pack suitable for decoding in the queue (for example no complete
+     one, or, when decoder is closed, no frame pack allowing for reopening of
+     the decoder, and so on)
+     - No frame available for decoding (it is not safe to call VPU decoder
+     without free frame - we learned that the hard way)
+     - (REORDERED streams only) - frame was fed, decoded and buffered inside
+     of decoder - nothing gets given for display
 
-        /* If this function returns true, one is allowed to use get_output_frame
-         and pop_output_frame. Speaking in STL terms, these are !.empty(),
-         .back() and .pop_back() */
-        virtual bool has_output_frame() const = 0;
-        /* Return frame at the very end of the output queue, i.e. next frame in
-         display order */
-        virtual const VPUOutputFrame &get_output_frame() const = 0;
-        /* This pops the frame off output queue. Note that is wait_for_frames
-         is true, then user is responsible for returning each frame by means of
-         return_output_frame */
-        virtual void pop_output_frame() = 0;
+     Now, when the frame is given out for display, what happens internally may
+     be either (streams without reordering, such as VP8 or h264 with reordering
+     enabled):
+     - Frame pack was taken off the queue, fed, decoded and given out for
+     display
 
-        /* Reordering flag on decoder. Currently just h264 decoders need this,
-         but we also want opaque interface. It doesn't do any harm to set
-         reordering for the codec that doesn't support it */
-        virtual void set_reordering(bool reorder) = 0;
+     OR (when reordering is enabled)
+     - Frame pack was taken off the queue, fed, decoded and given out for
+     display (this happens with B-frames for example)
+     - Frame pack was taken off the queue, fed, decoded and buffered, OTHER
+     frame (previously buffered one) is given out for display
+     - Frame pack wasn't taken off the queue (because it carries flush flag),
+     it was fed, decoded and frame is given out for display
+     - Frame pack with flush flag wasn't fed and decoded (because it already
+     was) but decoder is being called to return all previously buffered and
+     not given for display frames.
+     */
+    VPUOutputFrame step(PackQueue &queue);
 
-        /* There are basic decoding statistics that the user acting through
-         this interface no longer able to measure. For example there is no
-         "decode" method (decoding is hidden behind push_buffer() and
-         recycle_out_frame(), and may do 0...n frames at once). So all the
-         concrete decoders provide basic statistics themselves */
-        virtual const DecodingStats &get_stats() const = 0;
-    };
+    /* This function is like above, except it will also try to decode frame
+     packs not marked as complete. You should AVOID USING it if you can,
+     because it isn't efficient usage of VPU decoder. So:
+     - When decoding something that isn't encoded in real time (such as YT
+     video, stream saved to file, and so on) one should use step() exclusively
+     - When decoding live stream, one should supplant h264 parser m_is_complete
+     information by information derived from protocol itself. For example, in
+     Miracast one can force frames to be single slice only. Custom casting
+     protocols could have "last NAL" flag carried as a metadata and so on. Then
+     also step() can be safely used
+     - If nothing is known about the stream and it comes in real time
+     try_to_step() can be used, but it will have huge performance penalty in
+     case of multislice streams.
 
-    extern IVPUDecoder *createH264Decoder(CodecLogger &logger, size_t number_of_display_frames,
-                                          bool wait_for_frames);
-    extern IVPUDecoder *createVP8Decoder(CodecLogger &logger, size_t number_of_display_frames,
-                                         bool wait_for_frames);
+     Also, just like for step() decoder.has_frame_for_decoding() must be true,
+     but unlike step queue.has_frame_for_consumption() is enough, frame doesn't
+     have to be complete */
+    VPUOutputFrame try_to_step(PackQueue &queue);
+
+    /* If that function returns true, decode is possible. If it doesn't, then
+     frame must be returned first */
+    bool has_frame_for_decoding() const;
+
+    /* Frame with this physical_address finished displaying and can be reused
+     by the decoder */
+    void return_output_frame(long physical_address);
+
+    /* Some uses expect decoder to have flush function. Problem with VPU decoder
+     is that sometimes it needs to get display frames back even if flushing. And
+     of course this is not what the flushing is expected to do, so this function
+     is more like "flush up to one frame".
+
+     WARNING: just like step()/try_to_step() it requires has_frame_for_decoding()
+     to be true to actually do any useful work. So flushing only ends when
+     has_frame_for_decoding() is true and flush_step returns empty frame */
+    VPUOutputFrame flush_step();
+
+    /* This should be called to finish current decoding, for example just before
+     rewind operation. Right now flush is implemented internally, as a part of
+     decode(), so no need for it */
+    void close();
+
+    bool is_closed() const
+    {
+        return !m_session.get();
+    }
+
+    const DecodingStats &get_stats() const
+    {
+        return m_stats;
+    }
+
+    size_t get_number_of_frames_given() const
+    {
+        return m_frames_given;
+    }
+
+private:
+    VPUOutputFrame step_implementation(PackQueue &queue, PackPurpose purpose);
+    bool check_for_reopening(const Pack &pack) const;
+    bool feed_and_decode(PackQueue &queue, VPUOutputFrame &output,
+                         bool allow_for_incomplete_data);
+    bool feed_frame(PackQueue &queue);
+};
 }

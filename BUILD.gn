@@ -1,0 +1,39 @@
+# Copyright Airtame 2018
+
+static_library("vpu-decoder") {
+  sources = [
+    "src/lib/codec_common.hpp",
+    "src/lib/codec_logger.hpp",
+    "src/lib/h264_bitstream.cpp",
+    "src/lib/h264_bitstream.hpp",
+    "src/lib/h264_nal.hpp",
+    "src/lib/h264_nal.cpp",
+    "src/lib/h264_stream_parser.hpp",
+    "src/lib/h264_stream_parser.cpp",
+    "src/lib/ivf.h",
+    "src/lib/jpeg_parser.hpp",
+    "src/lib/jpeg_parser.cpp",
+    "src/lib/timestamp.hpp",
+    "src/lib/vp8_stream_parser.hpp",
+    "src/lib/vp8_stream_parser.cpp",
+    "src/lib/vpu.hpp",
+    "src/lib/vpu.cpp",
+    "src/lib/vpu_bitstream_buffer_monitoring.cpp",
+    "src/lib/vpu_bitstream_buffer_monitoring.hpp",
+    "src/lib/vpu_decoder_buffers.hpp",
+    "src/lib/vpu_decoder.cpp",
+    "src/lib/vpu_decoder.hpp",
+    "src/lib/vpu_decoding_session.cpp",
+    "src/lib/vpu_decoding_session.hpp",
+    "src/lib/vpu_dma_pointer.cpp",
+    "src/lib/vpu_dma_pointer.hpp",
+    "src/lib/vpu_h264_decoder.hpp",
+    "src/lib/vpu_h264_decoder.cpp",
+    "src/lib/vpu_jpeg_decoder.hpp",
+    "src/lib/vpu_jpeg_decoder.cpp",
+    "src/lib/vpu_vp8_decoder.hpp",
+    "src/lib/vpu_vp8_decoder.cpp",
+  ]
+
+  libs = [ "vpu" ]
+}

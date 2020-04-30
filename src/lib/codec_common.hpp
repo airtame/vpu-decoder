@@ -11,17 +11,23 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "timestamp.hpp"
+#include "frame_meta_data.hpp"
 
 namespace airtame {
 
+// TODO: this is legacy class, and I believe has some specific needs of Pierre's
+// and/or Chromium. Not sure if it still works that way?
+
+/* VideoBuffer - what user gives us, may contain one or more of protocol chunks
+(h264 NALs, vp8 frames, etc) */
 class VideoBuffer {
 public:
-    Timestamp timestamp = 0;
     const unsigned char *data = nullptr;
+    std::shared_ptr<FrameMetaData> meta;
     size_t size = 0;
     using FreeCallback = std::function<void(void)>;
     FreeCallback free_callback = 0;
+    void *user_data;
 };
 
 class FrameGeometry {
@@ -32,6 +38,9 @@ public:
     size_t m_true_width, m_true_height;
     /* Crop offset */
     size_t m_crop_left, m_crop_top;
+    /* Rotation information */
+    float m_rotation_deg{0};
+
     /* Ctors */
     FrameGeometry()
         : m_padded_width(0)
@@ -75,7 +84,7 @@ public:
     {
     }
 
-    bool operator != (const FrameGeometry &other)
+    bool operator != (const FrameGeometry &other) const
     {
         if (m_padded_width != other.m_padded_width) {
             return true;
@@ -99,14 +108,21 @@ public:
     }
 };
 
+enum class CodecType {
+    NONE,
+    H264,
+    VP8,
+    JPEG /* JPEG-type frame, whether parsed from JFIF or MJPEG stream */
+};
+
 class DecodingStats {
 public:
     /* Summed up time of all decoding operations (msec) */
     Timestamp total_decoding_time = 0;
-    /* Number of decode operations performed. Note that it not necessarily
-     means number of frames decoded, as especially with H264 there can be
-     0..n frames per decode operation */
-    uint64_t number_of_decode_operations = 0;
+    /* Number of succesfull decode operations performed. */
+    size_t number_of_decode_operations = 0;
+    /* Number of decode operations rolled back with NOT_ENOUGH_DATA */
+    size_t number_of_rolled_back_decodes = 0;
     /* Longest decode operation (msec) */
     Timestamp max_decode_duration = 0;
     /* Biggest DMA allocation size */
@@ -114,7 +130,6 @@ public:
 
     void update_decode_timing(Timestamp last_duration)
     {
-        ++number_of_decode_operations;
         total_decoding_time += last_duration;
         if (max_decode_duration < last_duration) {
             max_decode_duration = last_duration;
